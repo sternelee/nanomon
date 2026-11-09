@@ -33,6 +33,8 @@ pub fn view(a: *App, c: *ui.Context) void {
     // The headers' empty space moves the window, as a title bar's does.
     c.title_bar_height = kit.header_h;
     keys(c, a);
+    // The search leaves where its suggestions go while it draws the field.
+    a.suggest_at = null;
     const root = ui.div(c).row().sizeFull().bg(k.page);
     defer root.end();
     side.sidebar(c, a, k);
@@ -52,6 +54,7 @@ pub fn view(a: *App, c: *ui.Context) void {
             .about => pages.about.page(c, a, k),
         }
     }
+    sheet.suggest(c, a, k);
     sheet.menu(c, a, k);
     sheet.inspector(c, a, k);
     sheet.confirm(c, a, k);
@@ -67,7 +70,8 @@ pub fn body(c: *ui.Context) ui.Div {
 }
 
 /// ⌘1–⌘9 pick a page; ↑ and ↓ move the selection, ⌘I inspects it, ⌥⌘Q
-/// quits it, ⌘F finds, Space pauses, Escape closes what is open.
+/// quits it, ⌘F finds, Space pauses, Escape closes what is open (the
+/// search's suggestions first: its field then lets go of the keys).
 fn keys(c: *ui.Context, a: *App) void {
     const S = ui.Shortcut;
     const all = std.enums.values(app_mod.Page);
@@ -90,6 +94,6 @@ fn keys(c: *ui.Context, a: *App) void {
     }
     if (c.shortcut(.{ .key = 'p', .cmd = true, .shift = true })) a.paused = !a.paused;
     if (c.shortcut(.{ .key = S.escape })) {
-        if (a.confirm_marked) a.confirm_marked = false else if (a.graff.open) a.graff.open = false else if (a.confirm != null) a.confirm = null else if (a.inspect != null) a.inspect = null else if (a.menu) a.menu = false else a.selected = null;
+        if (a.suggest_at != null) c.focus = 0 else if (a.confirm_marked) a.confirm_marked = false else if (a.graff.open) a.graff.open = false else if (a.confirm != null) a.confirm = null else if (a.inspect != null) a.inspect = null else if (a.menu) a.menu = false else a.selected = null;
     }
 }

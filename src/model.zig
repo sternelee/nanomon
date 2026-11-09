@@ -10,6 +10,9 @@ pub const Process = struct {
     uid: u32,
     /// The app's name for an app's process, else its program's.
     name: []const u8,
+    /// The program's path, as the machine gives it: what the search looks
+    /// in for a path ("" where only its name is known).
+    path: []const u8 = "",
     user: []const u8,
     /// The app bundle it runs from, for its icon ("" if none).
     bundle: []const u8 = "",

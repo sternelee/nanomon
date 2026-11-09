@@ -5,6 +5,7 @@
 const std = @import("std");
 const model = @import("model.zig");
 const sample = @import("sample.zig");
+const search = @import("search.zig");
 const icons = @import("icons.zig");
 const nanoui = @import("nanoui");
 const builtin = @import("builtin");
@@ -125,6 +126,11 @@ pub const App = struct {
     sort: model.Sort = .cpu,
     ascending: bool = false,
     query: nanoui.ui.TextBuffer = .{},
+    /// Where the search's suggestions go, under the field: the frame that
+    /// draws the field leaves it, the one after draws them there; and the
+    /// field's box, for a press in them.
+    suggest_at: ?[2]f32 = null,
+    search_id: u64 = 0,
     /// The table's order: indices into the sample's processes.
     rows: std.ArrayList(u32) = .empty,
     dirty: bool = true,
@@ -252,14 +258,14 @@ pub const App = struct {
         const procs = a.sampler.procs.items;
         model.sort(procs, a.sort, a.ascending);
         a.rows.clearRetainingCapacity();
-        const q = std.mem.trim(u8, a.query.text(), " ");
+        const q = search.parse(a.query.text());
         for (procs, 0..) |p, i| {
             switch (a.filter) {
                 .all => {},
                 .mine => if (p.uid != a.uid) continue,
                 .system => if (p.uid != 0) continue,
             }
-            if (q.len > 0 and !matches(p, q)) continue;
+            if (!q.empty() and !search.matches(p, q, &a.sampler.ports)) continue;
             a.rows.append(a.sampler.gpa, @intCast(i)) catch return;
         }
         a.group();
@@ -271,7 +277,7 @@ pub const App = struct {
         a.apps.clearRetainingCapacity();
         var at: std.StringHashMapUnmanaged(usize) = .empty;
         defer at.deinit(gpa);
-        const q = std.mem.trim(u8, a.query.text(), " ");
+        const q = search.parse(a.query.text());
         for (a.sampler.procs.items) |p| {
             if (p.bundle.len == 0) continue;
             // Helpers inside an app count as the outermost app.
@@ -288,9 +294,9 @@ pub const App = struct {
             r.memory += p.memory;
             r.threads += p.threads;
         }
-        if (q.len > 0) {
+        if (!q.empty()) {
             var keep: usize = 0;
-            for (a.apps.items) |r| if (contains(r.name, q)) {
+            for (a.apps.items) |r| if (search.names(q, r.name)) {
                 a.apps.items[keep] = r;
                 keep += 1;
             };
@@ -324,19 +330,6 @@ pub const App = struct {
     pub fn outerBundle(path: []const u8) []const u8 {
         const end = std.mem.indexOf(u8, path, ".app") orelse return path;
         return path[0 .. end + 4];
-    }
-
-    fn matches(p: model.Process, q: []const u8) bool {
-        if (contains(p.name, q) or contains(p.user, q)) return true;
-        var buf: [16]u8 = undefined;
-        const pid = std.fmt.bufPrint(&buf, "{d}", .{p.pid}) catch return false;
-        return std.mem.startsWith(u8, pid, q);
-    }
-
-    fn contains(s: []const u8, q: []const u8) bool {
-        if (q.len > s.len) return false;
-        for (0..s.len - q.len + 1) |i| if (std.ascii.eqlIgnoreCase(s[i..][0..q.len], q)) return true;
-        return false;
     }
 
     /// Sorts by `key`; again on the same key turns the order around.

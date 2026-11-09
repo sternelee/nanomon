@@ -9,6 +9,7 @@ const model = @import("model.zig");
 const theme = @import("theme.zig");
 const kit = @import("view_kit.zig");
 const table = @import("view_table.zig");
+const sheet = @import("view_sheet.zig");
 const App = @import("app.zig").App;
 
 pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
@@ -23,8 +24,8 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         defer h.end();
         filter(c, a, k);
         const tabs = [_]model.Tab{ .cpu, .memory, .disk };
-        if (kit.segmented(c, k, &.{ "CPU", "Memory", "Disk" }, @intFromEnum(a.tab))) |i| a.show(tabs[i]);
-        search(c, a, k, 170);
+        if (kit.segmented(c, k, &.{ "CPU", "Memory", "Disk" }, @backingInt(a.tab))) |i| a.show(tabs[i]);
+        search(c, a, k, 250);
         const chosen = if (a.selected) |pid| a.find(pid) != null else false;
         if (tool(c, k, "info.circle", chosen)) a.inspect = a.selected;
         if (tool(c, k, "xmark.octagon", chosen)) a.confirm = a.selected;
@@ -76,16 +77,33 @@ fn filter(c: *ui.Context, a: *App, k: theme.Colors) void {
     ui.icon(c, "chevron.down", .{ .size = 8, .weight = .bold, .color = k.secondary });
 }
 
+/// The search field: ⌘F puts the keys in it, and while it is empty and
+/// focused its suggestions show under it (view_sheet.suggest draws them,
+/// where this leaves them).
 pub fn search(c: *ui.Context, a: *App, k: theme.Colors, w: f32) void {
     const f = ui.div(c).row().w(w).h(26).itemsCenter().gap(5).px(8).rounded(8).bg(k.control);
     defer f.end();
     ui.icon(c, "magnifyingglass", .{ .size = 11, .color = k.secondary });
+    const id = c.peekId(null);
+    a.search_id = id;
     if (a.find_search) {
         a.find_search = false;
-        c.focus = c.peekId(null);
+        c.focus = id;
     }
-    const res = ui.textField(c, &a.query, .{ .placeholder = "Search", .width = .fill, .size = 12, .bare = true });
+    const res = ui.textField(c, &a.query, .{
+        .placeholder = "Name, path, pid, port or user",
+        .width = .fill,
+        .size = 12,
+        .bare = true,
+    });
     if (res.changed) a.dirty = true;
+    // Under the field, where the last layout put it.
+    if (a.page == .processes and res.focused and a.query.text().len == 0) {
+        if (c.rects.get(id)) |r| {
+            const x = @min(r.x, c.size.w - sheet.suggest_w - 12);
+            a.suggest_at = .{ x, r.y + r.h + 4 };
+        }
+    }
 }
 
 /// A toolbar button: an icon, dimmed when there is nothing to act on.

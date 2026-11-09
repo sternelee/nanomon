@@ -186,7 +186,12 @@ Apple's private interfaces.
 - **Pages**: click the sidebar, or press ⌘1 to ⌘9.
 - **Pause**: the ⏸ button beside the range, or ⇧⌘P.
 - **Sort**: click a column; click it again to reverse the order.
-- **Search**: type to filter by name, user or process ID (⌘F).
+- **Search**: ⌘F, then type. Any of the words shows a process with it in
+  its name, its path, its user or the start of its pid (`safari mail`); a
+  word prefixed with - hides them (`-helper`). Figures: `cpu>10`, `mem>1GB`
+  (MB by default: `mem>800M`, `mem>=2GB`), `user:root`, `:3000` for what
+  listens on a port. Quote to keep a space ("Web Content"). While the
+  field is empty it lists examples: click one to use it.
 - **Select**: click a row, or move with ↑ and ↓.
 - **Inspect**: double-click a row, press ⓘ or ⌘I.
 - **Quit a process**: ⓧ or ⌥⌘Q. You're asked first. Quit sends SIGTERM,
@@ -205,6 +210,8 @@ src/sample.zig        a sample: CPU percentages, history, names, users
 src/sample_mac.zig    libproc, Mach and sysctl
 src/icons.zig         app icons for the table (macOS)
 src/ps.zig            /bin/ps for the processes nanomon may not read
+src/ports.zig         lsof for the ports they listen on (macOS)
+src/search.zig        the search: the words, the figures, what shows
 src/sample_linux.zig  /proc
 src/sample_none.zig   elsewhere
 src/sample_sys_mac.zig   chip, cores, load, uptime, threads, thermal, network
@@ -222,7 +229,7 @@ src/view_memory.zig   memory and GPU
 src/view_io.zig       disk and network
 src/view_apps.zig     apps
 src/view_about.zig    About This Mac
-src/view_sheet.zig    the filter menu, the inspector, the quit sheets
+src/view_sheet.zig    the filter menu, the search's examples, the inspector, the quit sheets
 src/view_graff.zig    the graff bubble and what it tells graff
 src/graff.zig         running graff one-shot, reading its answer
 src/tests_select.zig  marking, quitting together, the bubble (a fake graff)

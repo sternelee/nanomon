@@ -165,6 +165,7 @@ pub fn collect(s: *Sampler) sample.Ticks {
             .ppid = @intCast(info.ppid),
             .uid = info.uid,
             .name = named.name,
+            .path = named.owned,
             .bundle = named.bundle,
             .user = s.user(info.uid),
         };

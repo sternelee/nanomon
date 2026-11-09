@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const model = @import("model.zig");
 const Process = model.Process;
+const ports = @import("ports.zig");
 
 pub const os = switch (builtin.os.tag) {
     .macos => @import("sample_mac.zig"),
@@ -74,12 +75,15 @@ pub const Sampler = struct {
     samples: usize = 0,
     /// Told when figures come between samples (ps's answers).
     on_update: ?Notify = null,
+    /// The ports the processes listen on, as lsof answers (ports.zig).
+    ports: ports.Ports = .{},
     /// What ps said of a process the last time it changed: its CPU time,
     /// when that was, and the percent worked out from it.
     ps_seen: std.AutoHashMapUnmanaged(i32, PsSeen) = .empty,
 
     pub fn deinit(s: *Sampler) void {
         s.procs.deinit(s.gpa);
+        s.ports.deinit(s.gpa);
         s.prev.deinit(s.gpa);
         s.ps_seen.deinit(s.gpa);
         var it = s.names.valueIterator();
@@ -125,6 +129,7 @@ pub const Sampler = struct {
     /// Takes a sample at `now` (seconds).
     pub fn sample(s: *Sampler, now: f64) void {
         s.procs.clearRetainingCapacity();
+        s.ports.notify = if (s.on_update) |n| .{ .ctx = n.ctx, .func = n.func } else null;
         const ticks = os.collect(s);
         const wall = now - s.prev_wall;
         var next: std.AutoHashMapUnmanaged(i32, Prev) = .empty;
@@ -197,6 +202,7 @@ pub const Sampler = struct {
         }
         s.prev_ticks = ticks;
         s.prev_wall = now;
+        s.ports.refresh(s.gpa, s.samples);
         s.samples += 1;
         s.user_history.push(sy.cpu_user);
         s.system_history.push(sy.cpu_system);
@@ -224,7 +230,7 @@ pub const Sampler = struct {
         for (s.procs.items) |*p| {
             if (p.known) continue;
             const k = os.known(s, p.pid) orelse continue;
-            p.* = .{ .pid = p.pid, .ppid = p.ppid, .uid = p.uid, .name = p.name, .user = p.user, .bundle = p.bundle, .cpu_time_ns = k.time_ns, .memory = k.rss, .known = true, .from_ps = true };
+            p.* = .{ .pid = p.pid, .ppid = p.ppid, .uid = p.uid, .name = p.name, .path = p.path, .user = p.user, .bundle = p.bundle, .cpu_time_ns = k.time_ns, .memory = k.rss, .known = true, .from_ps = true };
             s.ps_seen.put(s.gpa, p.pid, .{ .time_ns = k.time_ns, .wall = now }) catch {};
         }
     }

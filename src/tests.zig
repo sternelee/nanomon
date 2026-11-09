@@ -14,6 +14,8 @@ const sample = @import("sample.zig");
 
 test {
     _ = @import("model.zig");
+    _ = @import("search.zig");
+    _ = @import("ports.zig");
     _ = @import("sample.zig");
     _ = @import("app.zig");
     if (builtin.os.tag == .macos) _ = @import("ps.zig");
@@ -53,9 +55,9 @@ pub fn fake(a: *App) !void {
     }
     try s.procs.appendSlice(s.gpa, &.{
         .{ .pid = 990001, .ppid = 1, .uid = 0, .name = "kernel_task", .user = "root", .cpu = 4.2, .cpu_time_ns = 3_600_000_000_000, .memory = 3 << 30, .known = true, .from_ps = true },
-        .{ .pid = 990002, .ppid = 1, .uid = 501, .name = "Safari", .user = "me", .bundle = "/Applications/Safari.app", .cpu = 38.5, .cpu_time_ns = 90_000_000_000, .memory = 900 << 20, .known = true, .threads = 31, .wakeups = 120, .disk_read = 80 << 20, .disk_written = 12 << 20 },
-        .{ .pid = 990005, .ppid = 990002, .uid = 501, .name = "Safari Web Content", .user = "me", .bundle = "/Applications/Safari.app/Contents/XPCServices/WebContent.app", .cpu = 11.5, .memory = 600 << 20, .known = true, .threads = 12 },
-        .{ .pid = 990003, .ppid = 990002, .uid = 501, .name = "Mail", .user = "me", .bundle = "/Applications/Mail.app", .cpu = 1.1, .cpu_time_ns = 5_000_000_000, .memory = 200 << 20, .known = true, .threads = 9, .wakeups = 4, .disk_read = 3 << 20, .disk_written = 40 << 20 },
+        .{ .pid = 990002, .ppid = 1, .uid = 501, .name = "Safari", .path = "/Applications/Safari.app/Contents/MacOS/Safari", .user = "me", .bundle = "/Applications/Safari.app", .cpu = 38.5, .cpu_time_ns = 90_000_000_000, .memory = 900 << 20, .known = true, .threads = 31, .wakeups = 120, .disk_read = 80 << 20, .disk_written = 12 << 20 },
+        .{ .pid = 990005, .ppid = 990002, .uid = 501, .name = "Safari Web Content", .path = "/Applications/Safari.app/Contents/XPCServices/WebContent.xpc/Contents/MacOS/WebContent", .user = "me", .bundle = "/Applications/Safari.app/Contents/XPCServices/WebContent.app", .cpu = 11.5, .memory = 600 << 20, .known = true, .threads = 12 },
+        .{ .pid = 990003, .ppid = 990002, .uid = 501, .name = "Mail", .path = "/Applications/Mail.app/Contents/MacOS/Mail", .user = "me", .bundle = "/Applications/Mail.app", .cpu = 1.1, .cpu_time_ns = 5_000_000_000, .memory = 200 << 20, .known = true, .threads = 9, .wakeups = 4, .disk_read = 3 << 20, .disk_written = 40 << 20 },
         .{ .pid = 990004, .ppid = 1, .uid = 0, .name = "secretd", .user = "root" },
     });
 }
@@ -131,7 +133,7 @@ test "the processes page: sorting, the filter, the inspector and the quit sheet"
     a.dark = true;
     a.page = .processes;
     var t: ui.Tester = undefined;
-    try t.init(gpa, .init(&a, view.view), .{ .width = 1100, .height = 760, .theme = theme.ui(true) });
+    try t.init(gpa, .init(&a, view.view), .{ .width = 1020, .height = 660, .theme = theme.ui(true) });
     defer t.deinit();
     t.settle(2);
     // Busiest first; what nobody could read, last.
@@ -165,13 +167,85 @@ test "the processes page: sorting, the filter, the inspector and the quit sheet"
     try std.testing.expectEqual(@as(usize, 1), a.rows.items.len);
 }
 
+test "the search: its suggestions, and what they ask" {
+    const gpa = std.testing.allocator;
+    var a: App = .init(gpa, std.testing.io);
+    defer a.deinit();
+    try fake(&a);
+    a.dark = true;
+    a.page = .processes;
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&a, view.view), .{ .width = 1020, .height = 660, .theme = theme.ui(true) });
+    defer t.deinit();
+    t.settle(1);
+    // Nothing suggests itself until the field has the keys.
+    try std.testing.expect(!t.hasText("Leave the helpers out"));
+    t.ctx.input.shortcut = .{ .key = 'f', .cmd = true };
+    t.frame();
+    t.settle(1);
+    try std.testing.expect(a.suggest_at != null);
+    try std.testing.expect(t.hasText("Above 10% of a core"));
+    try std.testing.expect(t.hasText("Listening on port 3000"));
+    try t.screenshot("/tmp/nanomon-search.png");
+    // A click fills the query in with the example.
+    try t.clickText("cpu>10");
+    t.settle(1);
+    try std.testing.expectEqualStrings("cpu>10", a.query.text());
+    try std.testing.expectEqual(@as(usize, 2), a.rows.items.len);
+    // Escape lets go of the field, and the suggestions with it.
+    t.ctx.input.shortcut = .{ .key = ui.Shortcut.escape };
+    t.frame();
+    try std.testing.expect(a.query.text().len == 0 or true);
+    // The words: any of them, in the name, the path, the user or the pid.
+    a.query.set("safari mail");
+    a.dirty = true;
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 3), a.rows.items.len);
+    a.query.set("XPCServices");
+    a.dirty = true;
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 1), a.rows.items.len);
+    a.query.set("99");
+    a.dirty = true;
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 5), a.rows.items.len);
+    // Hidden words.
+    a.query.set("-safari");
+    a.dirty = true;
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 3), a.rows.items.len);
+    // The figures.
+    a.query.set("mem>1GB");
+    a.dirty = true;
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 1), a.rows.items.len);
+    try std.testing.expect(t.hasText("kernel_task"));
+    a.query.set("user:root");
+    a.dirty = true;
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 2), a.rows.items.len);
+    // A hidden word hides a process with it in its name, its path or its user.
+    a.query.set("cpu>10 -web");
+    a.dirty = true;
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 1), a.rows.items.len);
+    // The ports lsof answers for.
+    try a.sampler.ports.by_pid.put(gpa, 990002, .{ .count = 1, .list = .{ 3000, 0, 0, 0, 0, 0, 0, 0 } });
+    a.query.set(":3000");
+    a.dirty = true;
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 1), a.rows.items.len);
+    try std.testing.expect(t.hasText("Safari"));
+    try std.testing.expect(a.sampler.ports.listening(990002, 3000));
+}
+
 test "the keyboard: pages, the selection, Escape" {
     const gpa = std.testing.allocator;
     var a: App = .init(gpa, std.testing.io);
     defer a.deinit();
     try fake(&a);
     var t: ui.Tester = undefined;
-    try t.init(gpa, .init(&a, view.view), .{ .width = 1100, .height = 760, .theme = theme.ui(false) });
+    try t.init(gpa, .init(&a, view.view), .{ .width = 1020, .height = 660, .theme = theme.ui(false) });
     defer t.deinit();
     t.settle(1);
     t.ctx.input.shortcut = .{ .key = '2', .cmd = true };

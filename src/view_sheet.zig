@@ -1,6 +1,7 @@
 //! What opens over the window, as in Activity Monitor: the View menu
-//! (which processes show), the inspector (a double click, ⓘ or ⌘I), and
-//! the sheet asking before a process is quit (ⓧ or ⌥⌘Q).
+//! (which processes show), the search's suggestions, the inspector (a
+//! double click, ⓘ or ⌘I), and the sheet asking before a process is quit
+//! (ⓧ or ⌥⌘Q).
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -38,6 +39,48 @@ pub fn menu(c: *ui.Context, a: *App, k: theme.Colors) void {
         mark.end();
         ui.text(c, f.title(), .{ .size = 13, .color = color });
     }
+}
+
+/// The width of the search's suggestions.
+pub const suggest_w: f32 = 320;
+
+/// The search's suggestions, under the field while it is empty and
+/// focused (view_procs.search leaves where): what the search can be asked
+/// for, each a click away. A hint fills the query in as its example shows.
+pub fn suggest(c: *ui.Context, a: *App, k: theme.Colors) void {
+    const at = a.suggest_at orelse return;
+    const hints = [_]struct { fill: []const u8, says: []const u8 }{
+        .{ .fill = "\"Safari\", Mail", .says = "A few at once" },
+        .{ .fill = "cpu>10", .says = "Above 10% of a core" },
+        .{ .fill = "mem>1GB", .says = "Using more than 1 GB" },
+        .{ .fill = "user:root", .says = "Run by root" },
+        .{ .fill = ":3000", .says = "Listening on port 3000" },
+        .{ .fill = "-helper", .says = "Leave the helpers out" },
+    };
+    const box = ui.div(c).absolute().offset(at[0], at[1]).column().w(suggest_w).p(5).rounded(8).bg(k.control_on).border(k.separator).shadowLg();
+    defer box.end();
+    const it = box.interaction();
+    for (hints) |h| {
+        ui.key(c, h.fill);
+        const item = ui.div(c).row().wFull().h(24).itemsCenter().gap(8).px(6).rounded(5).control();
+        const row = item.interaction();
+        if (row.hovered) c.node(item.index).style.background = k.selection;
+        defer item.end();
+        if (row.clicked) {
+            a.query.set(h.fill);
+            a.dirty = true;
+            // The keys stay in the field, to carry on from the example.
+            a.find_search = true;
+        }
+        const color = if (row.hovered) k.on_selection else k.text;
+        ui.text(c, h.fill, .{ .size = 11.5, .mono = true, .color = color });
+        ui.spacer(c);
+        ui.text(c, h.says, .{ .size = 11, .color = if (row.hovered) k.on_selection else k.secondary });
+    }
+    // A press in the panel takes the focus from the field for the frame,
+    // and the field hides the panel when it lets go: keep it, so the press
+    // is still the panel's when it is released.
+    if (c.input.pressed and it.hovered) c.focus = a.search_id;
 }
 
 /// The app's icon, large, if it has one.

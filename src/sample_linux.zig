@@ -62,7 +62,7 @@ pub fn collect(s: *Sampler) sample.Ticks {
             st.uids.put(s.gpa, pid, u) catch {};
             break :blk u;
         };
-        var p: model.Process = .{ .pid = pid, .ppid = ppid, .uid = uid, .name = s.name(pid, Namer{ .comm = comm }).name, .user = s.user(uid) };
+        var p: model.Process = .{ .pid = pid, .ppid = ppid, .uid = uid, .name = s.name(pid, Namer{ .comm = comm }).name, .path = s.name(pid, Namer{ .comm = comm }).owned, .user = s.user(uid) };
         p.cpu_time_ns = (utime + stime) * 1_000_000_000 / st.hz;
         p.threads = std.fmt.parseInt(u32, fields[17], 10) catch 0;
         if (dir.readFile(s.io, std.fmt.bufPrint(&path, "{d}/io", .{pid}) catch continue, &buf)) |io| {
