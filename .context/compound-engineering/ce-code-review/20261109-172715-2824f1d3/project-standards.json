@@ -1,0 +1,53 @@
+{
+  "merge_tier": "approve",
+  "findings": [
+    {
+      "id": "agents-001",
+      "tier": "info",
+      "summary": "Async external command pattern in ports.zig follows ps.zig but undocumented",
+      "file": "src/ports.zig",
+      "line": null,
+      "recommendation": "Consider documenting the async external command pattern (posix_spawn + pipe + fdwatch) in AGENTS.md. The pattern is now used in both ps.zig and ports.zig. AGENTS.md mentions ps.zig exists but doesn't describe the async pattern itself."
+    },
+    {
+      "id": "agents-002",
+      "tier": "info",
+      "summary": "Tests for ports functionality are minimal (setup only, no assertions)",
+      "file": "src/tests.zig",
+      "line": "232-240",
+      "recommendation": "The test sets up port data but makes no assertions (line 240: `_ = ports;`). Consider adding a basic assertion that the port lookup works, e.g., `try std.testing.expect(ports.listening(990002, 3000));`."
+    },
+    {
+      "id": "agents-003",
+      "tier": "approve",
+      "summary": "zig build test passes, new modules imported in tests.zig",
+      "file": "src/tests.zig",
+      "line": "17-18, 170",
+      "recommendation": "No action needed. New modules (ports.zig, search.zig) are imported at lines 17-18 and a test for search is added at line 170."
+    },
+    {
+      "id": "agents-004",
+      "tier": "approve",
+      "summary": "Platform-specific code correctly guarded with comptime checks",
+      "file": "src/ports.zig",
+      "line": "18, 54",
+      "recommendation": "No action needed. ports.zig uses `pub const supported = builtin.os.tag == .macos;` and `if (comptime !supported) return;` guards, following AGENTS.md patterns."
+    },
+    {
+      "id": "agents-005",
+      "tier": "approve",
+      "summary": "README.md updated with search syntax and new file documentation",
+      "file": "README.md",
+      "line": "189-192, 210-215, 232",
+      "recommendation": "No action needed. README.md documents the new search query language (words, -prefix, figures, user:, :port), the suggestion panel behavior, and adds ports.zig and search.zig to the file list."
+    },
+    {
+      "id": "agents-006",
+      "tier": "approve",
+      "summary": "Process.path field added consistently across platforms",
+      "file": "src/model.zig, src/sample_mac.zig, src/sample_linux.zig",
+      "line": "model.zig:13-15, sample_mac.zig:168, sample_linux.zig:65",
+      "recommendation": "No action needed. The path field is added to model.Process with a default empty string, and both macOS and Linux samplers populate it (sample_mac.zig:168, sample_linux.zig:65)."
+    }
+  ]
+}

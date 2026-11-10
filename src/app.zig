@@ -38,8 +38,7 @@ pub const Filter = enum {
 };
 
 /// The sidebar's pages.
-pub const Page = enum { overview, processes, cpu, memory, gpu, disk, network, apps, about };
-
+pub const Page = enum { overview, processes, cpu, memory, gpu, disk, network, apps, cleanup, about };
 /// How far back the graphs reach.
 pub const Range = enum {
     m1,
@@ -163,7 +162,16 @@ pub const App = struct {
     /// The clock samples go by when several views share them (the window
     /// and the panel each have their own frame clock); tests leave it null.
     clock: ?*const fn () f64 = null,
-
+    /// Cleanup: scanned cache items
+    cleanup_items: std.ArrayListUnmanaged(*@import("cleanup/item.zig").CacheItem) = .empty,
+    /// Cleanup: scan in progress
+    cleanup_scanning: bool = false,
+    /// Cleanup: scan phase (0=Library Caches, 1=Application Support, 2=Dev Tools, 3=done)
+    cleanup_scan_phase: u8 = 0,
+    /// Cleanup: selected items for deletion (by index)
+    cleanup_selected: std.AutoArrayHashMapUnmanaged(usize, void) = .empty,
+    /// Cleanup: confirm deletion
+    cleanup_confirm: bool = false,
     pub fn init(gpa: std.mem.Allocator, io: std.Io) App {
         const uid: u32 = if (comptime builtin.os.tag != .windows) getuid() else 0;
         return .{ .sampler = .{ .gpa = gpa, .io = io }, .icons = .{ .gpa = gpa }, .uid = uid };
@@ -227,6 +235,13 @@ pub const App = struct {
         a.graff.deinit(a.sampler.gpa);
         a.icons.deinit();
         a.sampler.deinit();
+        // Cleanup: deinit items
+        for (a.cleanup_items.items) |item| {
+            item.deinit();
+            a.sampler.gpa.destroy(item);
+        }
+        a.cleanup_items.deinit(a.sampler.gpa);
+        a.cleanup_selected.deinit(a.sampler.gpa);
     }
 
     /// Samples when it is time; returns the seconds until the next.

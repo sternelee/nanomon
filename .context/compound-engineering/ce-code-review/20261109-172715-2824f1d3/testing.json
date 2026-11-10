@@ -1,0 +1,47 @@
+{
+  "findings": [
+    {
+      "file": "src/search.zig",
+      "line": 189,
+      "category": "missing-test",
+      "severity": "low",
+      "summary": "No explicit test for malformed figure values (e.g., 'cpu>abc')",
+      "description": "The operand function returns null for non-numeric values after parseFloat fails, causing the keyword to fall back to being a word. While the code handles this gracefully (parse('cpufreq') is tested as a word), there is no explicit test for 'cpu>abc' or 'mem>xyz' to verify the fallback behavior. The existing test for 'cpufreq' covers a similar case but does not test the operator+malformed-value pattern.",
+      "recommended_action": "Add a test case: `q = parse(\"cpu>abc\"); try std.testing.expect(q.cpu == null and q.nwords == 1);` to verify that malformed figures are treated as words.",
+      "confidence": "high"
+    },
+    {
+      "file": "src/search.zig",
+      "line": 210,
+      "category": "missing-test",
+      "severity": "low",
+      "summary": "No explicit test for unknown memory units (e.g., 'mem>1X')",
+      "description": "The withUnit function returns null for unknown units, causing the operand to fail and the keyword to fall back to being a word. While the code handles this, there is no explicit test for unknown units like '1X', '1PB', or other unhandled suffixes. The existing tests cover known units (k, m, g, t, b, bytes, and their binary variants).",
+      "recommended_action": "Add a test case: `q = parse(\"mem>1X\"); try std.testing.expect(q.mem == null and q.nwords == 1);` to verify unknown units are treated as words.",
+      "confidence": "high"
+    },
+    {
+      "file": "src/tests.zig",
+      "line": 176,
+      "category": "adequate",
+      "severity": "none",
+      "summary": "UI test for search suggestions verifies actual behavior",
+      "description": "The test 'the search: its suggestions, and what they ask' does more than check UI element existence. It clicks on a suggestion ('cpu>10'), verifies the query field is filled (a.query.text() == 'cpu>10'), and verifies the table updates (a.rows.items.len changes from the baseline). It also tests various query types (words, hidden words, figures, user, port) and verifies row counts match expectations. This is appropriate behavioral testing.",
+      "recommended_action": "None. The test adequately verifies the click fills the query and updates the table.",
+      "confidence": "high"
+    },
+    {
+      "file": "src/ports.zig",
+      "line": 138,
+      "category": "adequate",
+      "severity": "none",
+      "summary": "Ports parse test covers key cases",
+      "description": "The test 'what lsof says' covers multiple ports per process, IPv4 and IPv6 address formats, ignores bad lines, and verifies the count and has() method. This is sufficient for the parse logic given the constrained input format from lsof.",
+      "recommended_action": "None. The parse test is adequate for the current implementation.",
+      "confidence": "high"
+    }
+  ],
+  "summary": "The diff has solid test coverage for the new search and ports modules. search.zig has comprehensive unit tests for tokenize, parse, matches, and names, including edge cases like empty queries, quoted strings, hidden words, and various unit formats. ports.zig has a sufficient parse test covering the lsof output format. The UI test in tests.zig verifies actual behavior (click fills query, table updates) rather than just UI existence. Two low-severity gaps: no explicit tests for malformed figure values (cpu>abc) or unknown memory units (mem>1X), though the code handles these by falling back to word treatment.",
+  "merge_tier": "merge",
+  "confidence": "high"
+}

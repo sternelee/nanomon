@@ -1,0 +1,91 @@
+{
+  "merge_tier": {
+    "must_fix": [
+      {
+        "id": "search-unclosed-quote",
+        "file": "src/search.zig",
+        "line": 114,
+        "title": "Unclosed quote treats rest of input as quoted content",
+        "body": "In tokenize(), line 114: `const end = std.mem.indexOfScalarPos(u8, text, i + 1, '\"') orelse text.len;`. If the user types an unclosed quote like `\"unclosed`, the parser treats everything from the opening quote to the end of the string as quoted content. This is not validated and could produce unexpected query behavior. While not a crash, it violates input validation expectations for a parser that should handle malformed input gracefully or reject it.",
+        "severity": "medium"
+      }
+    ],
+    "should_fix": [
+      {
+        "id": "ports-refresh-silent-failure",
+        "file": "src/ports.zig",
+        "line": 90,
+        "title": "lsof spawn failures are silently ignored",
+        "body": "In refresh(), line 90: posix_spawn failure returns silently without any error reporting. Line 94: pipe() failure also returns silently. Line 98: if posix_spawn fails, the read fd is closed and the function returns. This is intentional graceful degradation, but means users won't know if lsof is not available or failing. Consider logging or surfacing the error state so diagnostics are possible.",
+        "severity": "low"
+      },
+      {
+        "id": "search-empty-minus",
+        "file": "src/search.zig",
+        "line": 77,
+        "title": "Lone '-' token produces empty hide word",
+        "body": "Line 77: `q.hide(tok.text[1..])` - if tok.text is exactly '-', this slices to an empty string. The hide() function accepts empty strings (line 41-45) and adds them to the not[] array. An empty hide word will never match anything in inProcess() (line 256-260: contains() returns false if w.len > s.len, and empty string has len 0). This is harmless but wasteful (uses a slot in max_words for a no-op). Consider early-returning on '-' alone.",
+        "severity": "low"
+      },
+      {
+        "id": "search-empty-colon",
+        "file": "src/search.zig",
+        "line": 83,
+        "title": "Lone ':' token fails parseInt silently",
+        "body": "Line 83-86: `if (tok.text[0] == ':') { if (std.fmt.parseInt(u16, tok.text[1..], 10)) |port| ... else |_| {} }`. If tok.text is exactly ':', tok.text[1..] is empty, parseInt fails, and the error is silently caught. The token is then not added as a word (falling through to line 102). This means ':' alone is silently ignored, which may be confusing UX but is not a correctness bug.",
+        "severity": "low"
+      }
+    ],
+    "nice_to_fix": [],
+    "suppress": [
+      {
+        "id": "parse-lifetime-textbuffer",
+        "file": "src/app.zig",
+        "line": 260,
+        "title": "Query slices point into TextBuffer which is lifetime-safe",
+        "body": "Lines 260 and 283: search.parse(a.query.text()) returns a Query whose word slices point into the TextBuffer. The TextBuffer is owned by App and lives across frames. This is safe per the documented contract in search.zig line 62. No lifetime issue.",
+        "reason": "Code satisfies documented lifetime contract"
+      },
+      {
+        "id": "tokenize-empty-string",
+        "file": "src/search.zig",
+        "line": 107,
+        "title": "tokenize handles empty string correctly",
+        "body": "Line 107-126: tokenize() on empty string skips the outer while loop (i >= text.len on first iteration) and returns n=0. parse() then returns an empty Query. This is correct behavior.",
+        "reason": "Edge case is correctly handled"
+      },
+      {
+        "id": "ports-stop-cleanup",
+        "file": "src/ports.zig",
+        "line": 120,
+        "title": "stop() correctly cleans up all resources",
+        "body": "Lines 120-127: stop() cancels the fdwatch watch, closes the read fd, and waitpids on the child process. This ensures no resource leaks on failure or completion. The close() and waitpid() calls ignore errors intentionally, which is acceptable for cleanup.",
+        "reason": "Cleanup is correct and complete"
+      },
+      {
+        "id": "ports-parse-graceful-errors",
+        "file": "src/ports.zig",
+        "line": 147,
+        "title": "parse() handles malformed lsof output gracefully",
+        "body": "Lines 147-161: parse() skips lines with prefix 'p' if parseInt fails (catch 0), and skips 'n' lines if colon search or parseInt fails. This is intentional graceful degradation for malformed external command output.",
+        "reason": "Graceful error handling is intentional"
+      },
+      {
+        "id": "focus-restoration-coordination",
+        "file": "src/view_sheet.zig",
+        "line": 86,
+        "title": "Focus restoration in suggestion panel is sufficient",
+        "body": "Line 86: `if (c.input.pressed and it.hovered) c.focus = a.search_id;`. This restores focus to the search field when the user presses inside the suggestion panel. Combined with view_procs.zig line 83-84 (a.search_id is set on every frame) and the condition in view_procs.zig line 97-102 (suggest_at is only set when field is focused and empty), the coordination is correct. The panel will hide when the field loses focus (via the condition in view_procs.zig), and focus restoration ensures clicks in the panel work.",
+        "reason": "Focus coordination is correctly implemented"
+      },
+      {
+        "id": "ports-refresh-timing",
+        "file": "src/sample.zig",
+        "line": 205,
+        "title": "ports.refresh timing is intentional",
+        "body": "Line 205: s.ports.refresh(s.gpa, s.samples) is called after sorting and ordering processes. This is intentional: ports refresh is expensive (every 15 samples) and happens asynchronously via fdwatch, so the timing relative to process sampling doesn't affect correctness. The notify callback triggers a redraw when port data arrives.",
+        "reason": "Async refresh timing is intentional design"
+      }
+    ]
+  }
+}

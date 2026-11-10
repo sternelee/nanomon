@@ -1,6 +1,6 @@
 //! nanomon's window: a sidebar of pages, each with a figure beside its
 //! name (view_side.zig), and the page: an overview, the processes, CPU,
-//! memory, GPU, disk, network, apps, and this Mac. Samples every two
+//! memory, GPU, disk, network, apps, cleanup, and this Mac. Samples every two
 //! seconds while it shows (unless paused); between samples it draws only
 //! what moves.
 const std = @import("std");
@@ -20,6 +20,7 @@ const pages = struct {
     const memory = @import("view_memory.zig");
     const io = @import("view_io.zig");
     const apps = @import("view_apps.zig");
+    const cleanup = @import("view_cleanup.zig");
     const about = @import("view_about.zig");
 };
 
@@ -51,6 +52,7 @@ pub fn view(a: *App, c: *ui.Context) void {
             .disk => pages.io.disk(c, a, k),
             .network => pages.io.network(c, a, k),
             .apps => pages.apps.page(c, a, k),
+            .cleanup => pages.cleanup.page(c, a, k),
             .about => pages.about.page(c, a, k),
         }
     }

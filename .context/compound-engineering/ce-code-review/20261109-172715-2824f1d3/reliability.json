@@ -1,0 +1,50 @@
+{
+  "findings": [
+    {
+      "id": "R1",
+      "tier": "medium",
+      "location": "src/ports.zig:93-94",
+      "title": "posix_spawn_file_actions errors ignored silently",
+      "description": "posix_spawn_file_actions_adddup2 and posix_spawn_file_actions_addclose return values are ignored with _. If these calls fail, lsof may not have its stdout redirected to the pipe correctly, causing it to write to the parent process's stdout instead, which could block or pollute the terminal.",
+      "impact": "If file action setup fails, lsof may not redirect stdout correctly, potentially blocking the process or outputting to the wrong place. The subsequent posix_spawn call may succeed but produce no readable data.",
+      "recommendation": "Check the return values of posix_spawn_file_actions_adddup2 and posix_spawn_file_actions_addclose. If either fails, clean up with close(fds[0]) and close(fds[1]) then return early without spawning."
+    },
+    {
+      "id": "R2",
+      "tier": "high",
+      "location": "src/ports.zig:101",
+      "title": "fcntl O_NONBLOCK failure ignored silently",
+      "description": "The fcntl call to set O_NONBLOCK on the read end of the pipe ignores its return value. If this fails, the file descriptor remains blocking. When onReadable is called later, read() may block indefinitely waiting for lsof output, freezing the UI.",
+      "impact": "If fcntl fails to set O_NONBLOCK, the fdwatch callback could block on read(), freezing the entire application since onReadable is called from the event loop.",
+      "recommendation": "Check the fcntl return value. If it fails, call p.stop() to clean up the pipe and pid, then return early without registering the watch."
+    },
+    {
+      "id": "R3",
+      "tier": "low",
+      "location": "src/ports.zig:113",
+      "title": "appendSlice allocation failure drops data silently",
+      "description": "In onReadable, p.out.appendSlice(gpa, buf[0..@intCast(n)]) catch {} ignores allocation failures. If the allocator cannot grow the buffer, data from lsof is lost and the callback continues without indicating an error.",
+      "impact": "If the allocator is exhausted or fails to grow the buffer, partial lsof output is discarded. The final parse may produce incomplete or empty port data without any indication that data was lost.",
+      "recommendation": "If appendSlice fails, stop reading and close the fd (call p.stop()) to avoid reading more data that cannot be stored. Alternatively, log the error or set a flag to indicate data loss."
+    },
+    {
+      "id": "R4",
+      "tier": "low",
+      "location": "src/ports.zig:138",
+      "title": "parse allocation failure leaves hash map in inconsistent state",
+      "description": "The parse function calls out.getOrPut(gpa, pid) catch return to handle allocation failure. If this fails mid-parse after some entries have been added, the function returns early while the hash map contains partial new data mixed with old data that wasn't cleared.",
+      "impact": "If allocation fails during parsing, the by_pid map may contain a mix of old and new entries in an inconsistent state. Since refresh() calls clearRetainingCapacity() before parse, the old data is already gone, so this results in incomplete port data for the current sample.",
+      "recommendation": "Consider clearing the hash map again if parse fails mid-way, or accept that incomplete data is acceptable for a sampling tool. The current behavior (returning early) is acceptable given the sampling context, but could be documented."
+    },
+    {
+      "id": "R5",
+      "tier": "low",
+      "location": "src/ports.zig:114-121",
+      "title": "lsof crash or error produces empty port data silently",
+      "description": "If lsof crashes or exits with an error (non-zero status), onReadable still receives EOF (n==0), clears the old port data, and parses whatever output exists (possibly empty or error messages). No check is done on the child process exit status via waitpid.",
+      "impact": "If lsof fails (e.g., permission denied, binary not found), the port data becomes empty without any indication of the failure. The UI will show no ports for all processes, which may be misleading.",
+      "recommendation": "In stop(), check the child process exit status via waitpid's status parameter (WIFEXITED, WEXITSTATUS). If lsof exited non-zero or abnormally, log the error or skip clearing the old data to preserve the last known good state."
+    }
+  ],
+  "summary": "The ports.zig implementation has several silent error handling issues that could lead to resource leaks, blocking behavior, or silent data loss. The most critical is R2 (fcntl failure) which could block the UI. R1 (file actions) could cause lsof to misbehave. R3-R5 are lower priority but could lead to misleading or incomplete port data. Memory management across the codebase is generally correct with proper deinit patterns."
+}
