@@ -12,7 +12,7 @@
   <img alt="macOS · Linux" src="https://img.shields.io/badge/macOS%20·%20Linux-555">
   <img alt="One binary, under 1 MB" src="https://img.shields.io/badge/one%20binary-%3C1%20MB-44cc11">
   <img alt="No admin rights" src="https://img.shields.io/badge/admin%20rights-none-44cc11">
-  <img alt="Built in Zig 0.17" src="https://img.shields.io/badge/built%20in-Zig%200.17-f7a41d?logo=zig&logoColor=white">
+  <img alt="Built in Zig 0.17 on nanoui 0.14.0" src="https://img.shields.io/badge/built%20in-Zig%200.17%20on%20nanoui%200.14.0-f7a41d?logo=zig&logoColor=white">
   <img alt="MIT" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
 
@@ -265,4 +265,4 @@ keep CodeGraff's original **modified AGPLv3**, kept verbatim in
 - **[Harness](https://github.com/justrach/harness):** the Codegraff colors,
   and [graff](https://github.com/justrach/codegraff), the agent in the bubble.
 
-<p align="center"><sub>Built in Zig 0.17 on <a href="https://github.com/justrach/nanoui">nanoui</a> · <a href="LICENSE">MIT</a> · <a href="THIRD_PARTY_NOTICES.md">third-party notices</a></sub></p>
+<p align="center"><sub>Built in Zig 0.17 on <a href="https://github.com/justrach/nanoui">nanoui 0.14.0</a> · <a href="LICENSE">MIT</a> · <a href="THIRD_PARTY_NOTICES.md">third-party notices</a></sub></p>

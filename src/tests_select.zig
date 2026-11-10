@@ -46,13 +46,11 @@ test "processes are marked by their boxes, ⌘-click and ⇧-click, and quit tog
     t.settle(1);
     try std.testing.expect(a.marked.contains(990002) and a.selected == null);
     try std.testing.expect(t.hasText("1 marked"));
-    // ⌘-click (Control elsewhere) marks another.
+    // ⌘-click marks another.
     const mail = t.findText("Mail").?;
     t.ctx.input.cmd = true;
-    t.ctx.input.ctrl = true;
     t.click(mail.x + 4, mail.y + mail.h / 2);
     t.ctx.input.cmd = false;
-    t.ctx.input.ctrl = false;
     t.settle(1);
     try std.testing.expect(a.marked.contains(990003));
     // ⇧-click marks the run from the selected row.
