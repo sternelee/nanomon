@@ -10,6 +10,143 @@ const icons = @import("icons.zig");
 const nanoui = @import("nanoui");
 const builtin = @import("builtin");
 
+const item_mod = @import("cleanup/item.zig");
+const CacheItem = item_mod.CacheItem;
+const CacheScanner = @import("cleanup/scanner.zig").CacheScanner;
+const TrashManager = @import("cleanup/trash.zig").TrashManager;
+const remove = @import("cleanup/remove.zig");
+
+/// What a removal did, for the notice the page shows afterwards.
+pub const RemovalReport = struct {
+    moved: usize = 0,
+    removed: usize = 0,
+    failed: usize = 0,
+    freed: u64 = 0,
+};
+
+/// The Cleanup sidebar's tabs (App Caches, Dev Tools, Large Files, App
+/// Uninstaller), as the item model names them.
+pub const CleanupTab = item_mod.Tab;
+
+/// How many passes one Cleanup scan runs, for the "N of 13" the page shows.
+pub const cleanup_pass_count: u8 = 13;
+
+/// The disk's own figures, for the overview's bar.
+pub const Volume = @import("cleanup/diskmap.zig").Volume;
+
+/// How many items a tab holds, and what they are worth.
+pub const TabTotals = struct { count: usize, bytes: u64 };
+
+/// How the Cleanup page orders what it found.
+pub const CleanupSort = enum {
+    size,
+    name,
+    safety,
+};
+
+/// Which of what was found the Cleanup page shows.
+pub const CleanupFilter = enum {
+    all,
+    safe,
+    check,
+
+    pub fn title(self: CleanupFilter) []const u8 {
+        return switch (self) {
+            .all => "All",
+            .safe => "Safe",
+            .check => "Check First",
+        };
+    }
+};
+
+/// Runs the whole Cleanup scan off the UI thread. The main thread only polls
+/// `cleanup_done` and joins, so no window/UI call is ever made from here
+/// (Cocoa requires the main thread).
+fn cleanupScanWorker(a: *App) void {
+    var io_impl: std.Io.Threaded = std.Io.Threaded.init_single_threaded;
+    const io = io_impl.io();
+
+    // `cleanup_home` lets the tests scan a home of their own; the app leaves
+    // it null and the scan follows $HOME.
+    var scanner = (if (a.cleanup_home) |home| CacheScanner.initAt(a.sampler.gpa, io, home) else CacheScanner.init(a.sampler.gpa, io)) catch {
+        a.cleanup_scan_failed.store(true, .release);
+        a.cleanup_done.store(true, .release);
+        return;
+    };
+    defer scanner.deinit();
+    scanner.cancel = &a.cleanup_stop;
+    var volume: Volume = .{ .total = 0, .used = 0, .free = 0 };
+    scanner.volume = &volume;
+
+    // One pass at a time, publishing each as it finishes: the page fills in
+    // while the slower project walk carries on.
+    const Pass = struct { f: *const fn (*CacheScanner) anyerror!std.ArrayListUnmanaged(*CacheItem) };
+    const passes = [_]Pass{
+        .{ .f = CacheScanner.scanLibraryCaches },
+        .{ .f = CacheScanner.scanSystemJunk },
+        .{ .f = CacheScanner.scanDevCaches },
+        .{ .f = CacheScanner.scanApplicationSupport },
+        .{ .f = CacheScanner.scanLarge },
+        .{ .f = CacheScanner.scanApps },
+        .{ .f = CacheScanner.scanProjects },
+        .{ .f = CacheScanner.scanSimulators },
+        .{ .f = CacheScanner.scanXcodeComponents },
+        .{ .f = CacheScanner.scanBrewCasks },
+        .{ .f = CacheScanner.scanBrewFormulae },
+        .{ .f = CacheScanner.scanSnapshots },
+        .{ .f = CacheScanner.scanDiskMap },
+    };
+    for (passes, 0..) |pass, i| {
+        if (a.cleanup_stop.load(.acquire)) break;
+        if (pass.f(&scanner)) |result| {
+            var list = result;
+            publishCleanupResult(a, &list);
+        } else |_| {}
+        a.cleanup_progress.store(@intCast(i + 1), .release);
+    }
+
+    // The disk's figures come with the map, and are handed over like the
+    // items are: the main thread takes them under the same lock.
+    if (volume.total > 0) {
+        a.lockCleanup();
+        a.cleanup_volume_staged = volume;
+        a.unlockCleanup();
+    }
+    a.cleanup_done.store(true, .release);
+}
+
+/// Hand a finished pass to the main thread without touching the UI here.
+fn publishCleanupResult(a: *App, list: *std.ArrayListUnmanaged(*CacheItem)) void {
+    defer list.deinit(a.sampler.gpa);
+    a.lockCleanup();
+    defer a.unlockCleanup();
+    for (list.items) |item| {
+        a.cleanup_staging.append(a.sampler.gpa, item) catch {
+            item.deinit();
+            a.sampler.gpa.destroy(item);
+        };
+    }
+}
+
+/// Removes what the page ticked, off the UI thread. It touches the filesystem
+/// and the flags it was handed, and nothing of the window.
+fn cleanupRemoveWorker(a: *App) void {
+    var io_impl: std.Io.Threaded = std.Io.Threaded.init_single_threaded;
+    const io = io_impl.io();
+
+    var report: RemovalReport = .{ .failed = a.cleanup_removal_items.items.len };
+    if (a.cleanupTrash(io)) |trash| {
+        var owned = trash;
+        defer owned.deinit();
+        report = a.performRemovals(&owned);
+    } else |_| {}
+
+    a.lockCleanup();
+    a.cleanup_removal_staged = report;
+    a.unlockCleanup();
+    a.cleanup_removal_done.store(true, .release);
+}
+
 extern "c" fn kill(pid: c_int, sig: c_int) c_int;
 extern "c" fn getuid() c_uint;
 extern "c" fn getpid() c_int;
@@ -162,19 +299,469 @@ pub const App = struct {
     /// The clock samples go by when several views share them (the window
     /// and the panel each have their own frame clock); tests leave it null.
     clock: ?*const fn () f64 = null,
-    /// Cleanup: scanned cache items
-    cleanup_items: std.ArrayListUnmanaged(*@import("cleanup/item.zig").CacheItem) = .empty,
-    /// Cleanup: scan in progress
+    /// Cleanup: published scan results (CacheItem pointers)
+    cleanup_items: std.ArrayListUnmanaged(*CacheItem) = .empty,
+    /// Cleanup: a scan is running on a background thread
     cleanup_scanning: bool = false,
-    /// Cleanup: scan phase (0=Library Caches, 1=Application Support, 2=Dev Tools, 3=done)
-    cleanup_scan_phase: u8 = 0,
-    /// Cleanup: selected items for deletion (by index)
-    cleanup_selected: std.AutoArrayHashMapUnmanaged(usize, void) = .empty,
+    /// Set by the worker when its results are ready; polled once per frame.
+    cleanup_done: std.atomic.Value(bool) = .init(false),
+    /// What the worker has finished so far, handed over under the mutex.
+    cleanup_staging: std.ArrayListUnmanaged(*CacheItem) = .empty,
+    /// A spinlock for the handover: the critical sections move a handful of
+    /// pointers, so waiting is a few instructions, never a syscall.
+    cleanup_lock: std.atomic.Value(bool) = .init(false),
+    /// How many of the scan's passes have finished (for "3 of 5").
+    cleanup_progress: std.atomic.Value(u8) = .init(0),
+    /// The disk's figures, handed over with the results for the overview.
+    cleanup_volume_staged: ?Volume = null,
+    cleanup_volume: ?Volume = null,
+    /// Cleanup: a removal is running on a background thread (brew uninstall
+    /// and simctl delete take seconds; the window must keep drawing).
+    cleanup_removing: bool = false,
+    cleanup_removal_thread: ?std.Thread = null,
+    /// The items being removed, and which of them went: the worker fills the
+    /// second, the main thread reads it after joining.
+    cleanup_removal_items: std.ArrayListUnmanaged(*CacheItem) = .empty,
+    cleanup_removal_ok: std.ArrayListUnmanaged(bool) = .empty,
+    cleanup_removal_staged: ?RemovalReport = null,
+    cleanup_removal_done: std.atomic.Value(bool) = .init(false),
+    /// Set when the app is going away, so a long scan stops promptly.
+    cleanup_stop: std.atomic.Value(bool) = .init(false),
+    /// The home folder the tests scan; null in the app, which uses $HOME.
+    /// Borrowed: whoever sets it keeps it alive for the scan.
+    cleanup_home: ?[]const u8 = null,
+    /// The home whose Trash removals go to; null in the app, which uses the
+    /// user's own. Borrowed, like `cleanup_home`.
+    cleanup_trash_home: ?[]const u8 = null,
+    /// Whether the page scans by itself the first time it is opened (as
+    /// purge does); the tests turn it off and stage their own items.
+    cleanup_auto: bool = true,
+    /// Whether a scan has been asked for at all, so the page only starts one
+    /// on its own the first time.
+    cleanup_scanned: bool = false,
+    /// The worker thread, joined once it signals done.
+    cleanup_thread: ?std.Thread = null,
+    /// True if the scan could not be started.
+    cleanup_scan_failed: std.atomic.Value(bool) = .init(false),
+    /// Cleanup: what the page shows: the items the filter lets through, in
+    /// the chosen order. Rebuilt whenever the items, the filter or the order
+    /// change, never while drawing.
+    cleanup_visible: std.ArrayListUnmanaged(*CacheItem) = .empty,
+    /// Cleanup: the items ticked for deletion, by item, so sorting and
+    /// filtering never lose the tick.
+    cleanup_selected: std.AutoArrayHashMapUnmanaged(*CacheItem, void) = .empty,
+    /// Cleanup: how the list is ordered, and which way.
+    cleanup_sort: CleanupSort = .size,
+    cleanup_ascending: bool = false,
+    /// Cleanup: which safety levels show.
+    cleanup_filter: CleanupFilter = .all,
+    /// Cleanup: which tab of the page shows.
+    cleanup_tab: CleanupTab = .caches,
     /// Cleanup: confirm deletion
     cleanup_confirm: bool = false,
+    /// Cleanup: what just happened (moved to the Trash, or why not).
+    cleanup_notice: ?[]const u8 = null,
+    cleanup_notice_error: bool = false,
     pub fn init(gpa: std.mem.Allocator, io: std.Io) App {
         const uid: u32 = if (comptime builtin.os.tag != .windows) getuid() else 0;
         return .{ .sampler = .{ .gpa = gpa, .io = io }, .icons = .{ .gpa = gpa }, .uid = uid };
+    }
+
+    fn lockCleanup(a: *App) void {
+        while (a.cleanup_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn unlockCleanup(a: *App) void {
+        a.cleanup_lock.store(false, .release);
+    }
+
+    /// Starts a background Cleanup scan. Safe to call from the page's Scan
+    /// button: it only does bookkeeping, then hands all I/O to a worker.
+    pub fn startCleanupScan(a: *App) void {
+        // A removal holds pointers into the list a scan would free.
+        if (a.cleanup_scanning or a.cleanup_removing) return;
+
+        for (a.cleanup_items.items) |item| {
+            item.deinit();
+            a.sampler.gpa.destroy(item);
+        }
+        a.cleanup_items.clearRetainingCapacity();
+        a.cleanup_visible.clearRetainingCapacity();
+        a.cleanup_selected.clearRetainingCapacity();
+        a.lockCleanup();
+        for (a.cleanup_staging.items) |item| {
+            item.deinit();
+            a.sampler.gpa.destroy(item);
+        }
+        a.cleanup_staging.clearRetainingCapacity();
+        a.unlockCleanup();
+        a.cleanup_confirm = false;
+        a.clearCleanupNotice();
+        a.cleanup_scanned = true;
+        a.cleanup_scan_failed.store(false, .release);
+        a.cleanup_progress.store(0, .release);
+        a.cleanup_stop.store(false, .release);
+        a.cleanup_done.store(false, .release);
+        a.cleanup_scanning = true;
+
+        const t = std.Thread.spawn(.{}, cleanupScanWorker, .{a}) catch {
+            a.cleanup_thread = null;
+            a.cleanup_scanning = false;
+            a.cleanup_scan_failed.store(true, .release);
+            return;
+        };
+        a.cleanup_thread = t;
+    }
+
+    /// Called once per frame from view.zig. Keeps the frame loop alive while
+    /// the worker runs; when it signals done, joins it (a happens-before
+    /// barrier), publishes the results and stops. Returns true while a scan
+    /// still needs frames.
+    pub fn pollCleanupScan(a: *App) bool {
+        if (!a.cleanup_scanning) return false;
+
+        // Take whatever the worker has finished since the last frame, so the
+        // page fills in while the slower passes carry on.
+        var took = false;
+        a.lockCleanup();
+        if (a.cleanup_staging.items.len > 0) {
+            for (a.cleanup_staging.items) |item| {
+                a.cleanup_items.append(a.sampler.gpa, item) catch {
+                    item.deinit();
+                    a.sampler.gpa.destroy(item);
+                };
+            }
+            a.cleanup_staging.clearRetainingCapacity();
+            took = true;
+        }
+        if (a.cleanup_volume_staged) |disk| {
+            a.cleanup_volume = disk;
+            a.cleanup_volume_staged = null;
+            took = true;
+        }
+        a.unlockCleanup();
+        if (took) {
+            a.refreshCleanupView();
+            if (a.window) |w| w.redraw();
+        }
+
+        if (!a.cleanup_done.load(.acquire)) return true;
+
+        if (a.cleanup_thread) |t| {
+            t.join();
+            a.cleanup_thread = null;
+        }
+        a.cleanup_scanning = false;
+        a.cleanup_progress.store(0, .release);
+        a.refreshCleanupView();
+        if (a.window) |w| w.redraw();
+        return false;
+    }
+
+    /// Rebuild what the page shows: the items the filter lets through, in the
+    /// chosen order. Cheap enough to run whenever anything changes.
+    pub fn refreshCleanupView(a: *App) void {
+        a.cleanup_visible.clearRetainingCapacity();
+        for (a.cleanup_items.items) |item| {
+            if (item.category.tab() != a.cleanup_tab) continue;
+            const level = item.safety_info.level;
+            const keep = switch (a.cleanup_filter) {
+                .all => true,
+                .safe => level == .safe,
+                .check => level == .medium,
+            };
+            if (keep) a.cleanup_visible.append(a.sampler.gpa, item) catch {};
+        }
+        std.sort.pdq(*CacheItem, a.cleanup_visible.items, a, cleanupLessThan);
+    }
+
+    /// Show another tab of the Cleanup page.
+    pub fn cleanupSetTab(a: *App, tab: CleanupTab) void {
+        a.cleanup_tab = tab;
+        a.refreshCleanupView();
+    }
+
+    /// What everything found for one tab is worth, and how many items.
+    pub fn cleanupTabTotals(a: *App, tab: CleanupTab) TabTotals {
+        var count: usize = 0;
+        var bytes: u64 = 0;
+        for (a.cleanup_items.items) |item| {
+            if (item.category.tab() != tab) continue;
+            count += 1;
+            bytes += item.sizeBytes();
+        }
+        return .{ .count = count, .bytes = bytes };
+    }
+
+    fn cleanupLessThan(a: *App, lhs: *CacheItem, rhs: *CacheItem) bool {
+        const rank = switch (a.cleanup_sort) {
+            .size => std.math.order(lhs.sizeBytes(), rhs.sizeBytes()),
+            .name => std.mem.order(u8, lhs.app_name, rhs.app_name),
+            .safety => std.math.order(lhs.safety_info.level.sortOrder(), rhs.safety_info.level.sortOrder()),
+        };
+        if (rank != .eq) {
+            const first = rank == .lt;
+            return if (a.cleanup_ascending) first else !first;
+        }
+        // A tie: the bigger one first, then by name, so the order never
+        // depends on the order the scan happened to find them in.
+        if (lhs.sizeBytes() != rhs.sizeBytes()) return lhs.sizeBytes() > rhs.sizeBytes();
+        return std.mem.lessThan(u8, lhs.app_name, rhs.app_name);
+    }
+
+    /// Clicking a column header: same column flips the order, a new one
+    /// starts with the biggest (or first) on top.
+    pub fn cleanupSortBy(a: *App, sort: CleanupSort) void {
+        if (a.cleanup_sort == sort) {
+            a.cleanup_ascending = !a.cleanup_ascending;
+        } else {
+            a.cleanup_sort = sort;
+            // Size starts with the biggest, the way a cleanup list should;
+            // names and safety start at their beginning.
+            a.cleanup_ascending = sort != .size;
+        }
+        a.refreshCleanupView();
+    }
+
+    pub fn cleanupSetFilter(a: *App, filter: CleanupFilter) void {
+        a.cleanup_filter = filter;
+        a.refreshCleanupView();
+    }
+
+    pub fn cleanupIsSelected(a: *App, item: *CacheItem) bool {
+        return a.cleanup_selected.contains(item);
+    }
+
+    pub fn cleanupToggle(a: *App, item: *CacheItem) void {
+        if (a.cleanup_selected.contains(item)) {
+            _ = a.cleanup_selected.swapRemove(item);
+        } else {
+            a.cleanup_selected.put(a.sampler.gpa, item, {}) catch {};
+        }
+    }
+
+    /// Whether everything the page shows is already ticked.
+    pub fn cleanupAllSelected(a: *App) bool {
+        if (a.cleanup_visible.items.len == 0) return false;
+        for (a.cleanup_visible.items) |item| {
+            if (!a.cleanup_selected.contains(item)) return false;
+        }
+        return true;
+    }
+
+    /// The header's box: tick everything the filter shows, or clear it.
+    pub fn cleanupToggleAll(a: *App) void {
+        if (a.cleanupAllSelected()) {
+            a.cleanup_selected.clearRetainingCapacity();
+            return;
+        }
+        for (a.cleanup_visible.items) |item| {
+            a.cleanup_selected.put(a.sampler.gpa, item, {}) catch {};
+        }
+    }
+
+    /// What the ticked items would give back.
+    pub fn cleanupSelectedBytes(a: *App) u64 {
+        var total: u64 = 0;
+        var it = a.cleanup_selected.iterator();
+        while (it.next()) |entry| total += entry.key_ptr.*.sizeBytes();
+        return total;
+    }
+
+    /// The word for what the ticked items are about to get: the same one when
+    /// they agree, "Remove" when they do not.
+    pub fn cleanupSelectionVerb(a: *App) []const u8 {
+        var verb: ?[]const u8 = null;
+        var it = a.cleanup_selected.iterator();
+        while (it.next()) |entry| {
+            const word = entry.key_ptr.*.removal.verb();
+            if (verb) |have| {
+                if (!std.mem.eql(u8, have, word)) return "Remove";
+            } else verb = word;
+        }
+        return verb orelse "Remove";
+    }
+
+    /// Whether everything ticked goes to the Trash (so it can be put back).
+    pub fn cleanupSelectionUndoable(a: *App) bool {
+        var it = a.cleanup_selected.iterator();
+        while (it.next()) |entry| {
+            if (!entry.key_ptr.*.removal.trashed()) return false;
+        }
+        return true;
+    }
+
+    /// What the rows the page is showing are worth.
+    pub fn cleanupVisibleBytes(a: *App) u64 {
+        var total: u64 = 0;
+        for (a.cleanup_visible.items) |item| total += item.sizeBytes();
+        return total;
+    }
+
+    /// Whether any size on show is a floor: a folder's walk hit its file
+    /// limit. Only what the page is showing counts.
+    pub fn cleanupApprox(a: *App) bool {
+        for (a.cleanup_visible.items) |item| {
+            if (item.approx()) return true;
+        }
+        return false;
+    }
+
+    /// How many of the scan's passes have finished.
+    pub fn cleanupProgress(a: *App) u8 {
+        return a.cleanup_progress.load(.acquire);
+    }
+
+    fn setCleanupNotice(a: *App, text: []const u8, is_error: bool) void {
+        a.clearCleanupNotice();
+        a.cleanup_notice = a.sampler.gpa.dupe(u8, text) catch null;
+        a.cleanup_notice_error = is_error;
+    }
+
+    pub fn clearCleanupNotice(a: *App) void {
+        if (a.cleanup_notice) |text| a.sampler.gpa.free(text);
+        a.cleanup_notice = null;
+        a.cleanup_notice_error = false;
+    }
+
+    /// Remove the ticked items. The work goes to a worker — `brew uninstall`
+    /// and `simctl delete` take seconds, and the window must keep drawing —
+    /// and `pollCleanupRemoval` applies what it did.
+    pub fn cleanupDeleteSelected(a: *App) void {
+        a.cleanup_confirm = false;
+        if (a.cleanup_removing) return;
+        if (a.collectRemovals() == 0) return;
+
+        a.cleanup_removal_done.store(false, .release);
+        a.cleanup_removing = true;
+        const t = std.Thread.spawn(.{}, cleanupRemoveWorker, .{a}) catch {
+            // No thread to be had: do it here rather than not at all.
+            a.cleanup_removing = false;
+            a.cleanupDeleteNow(null);
+            return;
+        };
+        a.cleanup_removal_thread = t;
+    }
+
+    /// Called once per frame from view.zig while a removal runs. Returns true
+    /// while the page still has to wait for frames.
+    pub fn pollCleanupRemoval(a: *App) bool {
+        if (!a.cleanup_removing) return false;
+        if (!a.cleanup_removal_done.load(.acquire)) return true;
+
+        if (a.cleanup_removal_thread) |t| {
+            t.join();
+            a.cleanup_removal_thread = null;
+        }
+        a.cleanup_removing = false;
+        const report = blk: {
+            a.lockCleanup();
+            defer a.unlockCleanup();
+            const staged = a.cleanup_removal_staged orelse RemovalReport{ .failed = a.cleanup_removal_items.items.len };
+            a.cleanup_removal_staged = null;
+            break :blk staged;
+        };
+        a.applyRemovals(report);
+        return false;
+    }
+
+    /// The removals, done here and now: the tests' way in (they hand a Trash
+    /// inside their own home). The app runs the same work on a worker.
+    pub fn cleanupDeleteNow(a: *App, trash: ?*TrashManager) void {
+        a.cleanup_confirm = false;
+        if (a.cleanup_removing) return;
+        if (a.collectRemovals() == 0) return;
+
+        if (trash) |given| {
+            a.applyRemovals(a.performRemovals(given));
+            return;
+        }
+        var own = a.cleanupTrash(a.sampler.io) catch {
+            a.cleanup_removal_items.clearRetainingCapacity();
+            a.cleanup_removal_ok.clearRetainingCapacity();
+            a.setCleanupNotice("There is no Trash to move these to.", true);
+            return;
+        };
+        defer own.deinit();
+        a.applyRemovals(a.performRemovals(&own));
+    }
+
+    /// The Trash removals go to: the user's own, or the tests' temporary one.
+    fn cleanupTrash(a: *App, io: std.Io) !TrashManager {
+        if (a.cleanup_trash_home) |home| return TrashManager.initAt(a.sampler.gpa, io, home);
+        return TrashManager.init(a.sampler.gpa, io);
+    }
+
+    /// Take the ticked items into the removal list, one flag each.
+    fn collectRemovals(a: *App) usize {
+        a.cleanup_removal_items.clearRetainingCapacity();
+        a.cleanup_removal_ok.clearRetainingCapacity();
+        for (a.cleanup_items.items) |item| {
+            if (!a.cleanup_selected.contains(item)) continue;
+            if (!item.removal.removable()) continue;
+            a.cleanup_removal_items.append(a.sampler.gpa, item) catch continue;
+            a.cleanup_removal_ok.append(a.sampler.gpa, false) catch {};
+        }
+        return a.cleanup_removal_items.items.len;
+    }
+
+    /// Do the removals. Touches the filesystem and the flags, nothing else,
+    /// so it can run on a worker.
+    fn performRemovals(a: *App, trash: *TrashManager) RemovalReport {
+        var report: RemovalReport = .{};
+        for (a.cleanup_removal_items.items, 0..) |item, i| {
+            const gone = remove.remove(a.sampler.gpa, trash, item) == .removed;
+            if (i < a.cleanup_removal_ok.items.len) a.cleanup_removal_ok.items[i] = gone;
+            if (!gone) {
+                report.failed += 1;
+                continue;
+            }
+            report.freed += item.sizeBytes();
+            if (item.removal.trashed()) report.moved += 1 else report.removed += 1;
+        }
+        return report;
+    }
+
+    /// Take what went off the page, free it, and say what happened.
+    fn applyRemovals(a: *App, report: RemovalReport) void {
+        var i: usize = 0;
+        while (i < a.cleanup_items.items.len) {
+            const item = a.cleanup_items.items[i];
+            var gone = false;
+            for (a.cleanup_removal_items.items, 0..) |candidate, at| {
+                if (candidate != item) continue;
+                gone = at < a.cleanup_removal_ok.items.len and a.cleanup_removal_ok.items[at];
+                break;
+            }
+            if (gone) {
+                _ = a.cleanup_selected.swapRemove(item);
+                item.deinit();
+                a.sampler.gpa.destroy(item);
+                _ = a.cleanup_items.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        a.cleanup_removal_items.clearRetainingCapacity();
+        a.cleanup_removal_ok.clearRetainingCapacity();
+
+        var buf: [160]u8 = undefined;
+        var size_buf: [32]u8 = undefined;
+        const size = @import("cleanup/item.zig").formatBytes(report.freed, &size_buf);
+        if (report.failed == 0) {
+            const text = if (report.removed == 0)
+                std.fmt.bufPrint(&buf, "Moved {d} item{s} ({s}) to the Trash.", .{ report.moved, if (report.moved == 1) "" else "s", size }) catch "Moved to the Trash."
+            else if (report.moved == 0)
+                std.fmt.bufPrint(&buf, "Removed {d} item{s} ({s}).", .{ report.removed, if (report.removed == 1) "" else "s", size }) catch "Removed."
+            else
+                std.fmt.bufPrint(&buf, "Moved {d} to the Trash and removed {d} ({s}).", .{ report.moved, report.removed, size }) catch "Done.";
+            a.setCleanupNotice(text, false);
+        } else {
+            const text = std.fmt.bufPrint(&buf, "Freed {s}; {d} of {d} could not be removed.", .{ size, report.failed, report.failed + report.moved + report.removed }) catch "Some items could not be removed.";
+            a.setCleanupNotice(text, true);
+        }
+        a.refreshCleanupView();
+        if (a.window) |w| w.redraw();
     }
 
     /// Hears of ps's answers; `a` must stay where it is from now on.
@@ -229,19 +816,38 @@ pub const App = struct {
     }
 
     pub fn deinit(a: *App) void {
+        // A scan may still be running; join it before freeing what it owns.
+        if (a.cleanup_thread) |t| {
+            a.cleanup_stop.store(true, .release);
+            t.join();
+            a.cleanup_thread = null;
+        }
+        // So may a removal.
+        if (a.cleanup_removal_thread) |t| {
+            t.join();
+            a.cleanup_removal_thread = null;
+        }
+        a.cleanup_removal_items.deinit(a.sampler.gpa);
+        a.cleanup_removal_ok.deinit(a.sampler.gpa);
+        for (a.cleanup_staging.items) |item| {
+            item.deinit();
+            a.sampler.gpa.destroy(item);
+        }
+        a.cleanup_staging.deinit(a.sampler.gpa);
         a.rows.deinit(a.sampler.gpa);
         a.apps.deinit(a.sampler.gpa);
         a.marked.deinit(a.sampler.gpa);
         a.graff.deinit(a.sampler.gpa);
         a.icons.deinit();
         a.sampler.deinit();
-        // Cleanup: deinit items
         for (a.cleanup_items.items) |item| {
             item.deinit();
             a.sampler.gpa.destroy(item);
         }
         a.cleanup_items.deinit(a.sampler.gpa);
+        a.cleanup_visible.deinit(a.sampler.gpa);
         a.cleanup_selected.deinit(a.sampler.gpa);
+        a.clearCleanupNotice();
     }
 
     /// Samples when it is time; returns the seconds until the next.

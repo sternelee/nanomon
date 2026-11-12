@@ -36,9 +36,23 @@ pub fn sidebar(c: *ui.Context, a: *App, k: theme.Colors) void {
     item(c, a, k, .{ .page = .gpu, .icon = "cube", .name = "GPU" }, k.red, c.print("{d:.0}%", .{sy.gpu}));
     item(c, a, k, .{ .page = .disk, .icon = "internaldrive", .name = "Disk" }, k.orange, c.print("{s}", .{model.rate(&b, sy.read_sec + sy.written_sec)}));
     item(c, a, k, .{ .page = .network, .icon = "network", .name = "Network" }, k.teal, c.print("{s}", .{model.rate(&b, sy.net_in_sec + sy.net_out_sec)}));
+    // Cleanup, with its parts under it, before the machine's own pages.
+    section(c, k, "Cleanup");
+    const tabs = [_]app_mod.CleanupTab{ .caches, .dev, .large, .uninstall };
+    for (tabs) |tab| {
+        const totals = a.cleanupTabTotals(tab);
+        // A tab whose items have no size to report (a snapshot) shows how
+        // many there are instead of a made-up zero.
+        const figure = if (totals.count == 0)
+            ""
+        else if (totals.bytes == 0)
+            c.print("{d}", .{totals.count})
+        else
+            c.print("{s}", .{model.bytes(&b, totals.bytes)});
+        subItem(c, a, k, tab, figure);
+    }
     section(c, k, "System");
     item(c, a, k, .{ .page = .apps, .icon = "square.grid.3x3", .name = "Apps" }, k.purple, c.print("{d}", .{a.apps.items.len}));
-    item(c, a, k, .{ .page = .cleanup, .icon = "trash", .name = "Cleanup" }, k.orange, "");
     item(c, a, k, .{ .page = .about, .icon = "desktopcomputer", .name = "About This Mac" }, k.gray, "");
     ui.spacer(c);
     update(c, a, k);
@@ -80,6 +94,28 @@ fn item(c: *ui.Context, a: *App, k: theme.Colors, it: Item, color: ui.Color, fig
     ui.text(c, it.name, .{ .size = 13, .weight = if (on) .semibold else .regular, .color = if (on) k.on_picked else k.text });
     ui.spacer(c);
     if (figure.len > 0) ui.text(c, figure, .{ .size = 11, .mono = true, .color = if (on) k.on_picked.alpha(0.8) else k.secondary });
+}
+
+/// A Cleanup tab under its section's heading: a dot instead of a chip, so
+/// the four of them read as parts of the one page.
+fn subItem(c: *ui.Context, a: *App, k: theme.Colors, tab: app_mod.CleanupTab, figure: []const u8) void {
+    const name = tab.title();
+    ui.key(c, name);
+    const on = a.page == .cleanup and a.cleanup_tab == tab;
+    var d = ui.div(c).row().wFull().h(30).itemsCenter().gap(8).pl(8).pr(7).rounded(7).control();
+    d = if (on) d.bg(k.picked) else d.hover(k.hover);
+    defer d.end();
+    if (d.clicked()) {
+        a.page = .cleanup;
+        a.cleanupSetTab(tab);
+        a.menu = false;
+        if (a.window) |w| w.redraw();
+    }
+    // The tab's own icon, as the pages above carry theirs.
+    kit.chip(c, tab.icon(), if (on) k.on_picked else kit.tabColor(tab, k), 18, false);
+    ui.text(c, name, .{ .size = 12, .weight = if (on) .semibold else .regular, .color = if (on) k.on_picked else k.text });
+    ui.spacer(c);
+    if (figure.len > 0) ui.text(c, figure, .{ .size = 10.5, .mono = true, .color = if (on) k.on_picked.alpha(0.8) else k.secondary });
 }
 
 /// "Live · every 2 s", or "Paused".

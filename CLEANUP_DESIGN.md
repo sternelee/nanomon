@@ -1,5 +1,10 @@
 # Nanomon Space Cleanup Feature Design
 
+> **Status:** implemented. This file records the original design and the
+> research behind it. What actually shipped — the catalogs, safety rules,
+> threading, limits and tests — is documented in
+> [`docs/CLEANUP.md`](docs/CLEANUP.md).
+
 ## Research Summary: Purge-app Architecture
 
 ### Core Concepts from Purge-app
@@ -40,7 +45,7 @@
 - Stream results via AsyncStream-like pattern
 
 **UI Components**
-- New sidebar page: "Cleanup" (⌘7)
+- New sidebar page: "Cleanup" (⌘9)
 - Table view showing: app name, size, safety label
 - Safety labels: ✅ Safe to Clean, ⚠️ Check First
 - Selection via checkboxes, ⌘-click, ⇧-click (reuse existing patterns)
@@ -108,7 +113,7 @@
 - Use existing nanomon color palette
 
 ### Keyboard Shortcuts
-- ⌘7: Cleanup page
+- ⌘9: Cleanup page
 - ⌘R: Scan current category
 - ⌥⌘1-3: Filter by safety level
 - ⌘F: Search (reuse existing)

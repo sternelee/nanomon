@@ -1,4 +1,7 @@
-//! The Cleanup page: scan and delete app caches and system junk.
+//! The Cleanup page (⌘9): what the scan found, biggest first, with the
+//! safety of each row in plain sight. Rows tick with a click (the header's
+//! box ticks all of them, or clears them), the header sorts, and the ticked
+//! rows move to the Trash together once the sheet is answered.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -6,31 +9,41 @@ const theme = @import("theme.zig");
 const kit = @import("view_kit.zig");
 const app_mod = @import("app.zig");
 const App = app_mod.App;
-
-const cleanup_mod = @import("cleanup/scanner.zig");
-const CacheScanner = cleanup_mod.CacheScanner;
+const CleanupFilter = app_mod.CleanupFilter;
+const CleanupSort = app_mod.CleanupSort;
+const CleanupTab = app_mod.CleanupTab;
 const item_mod = @import("cleanup/item.zig");
 const CacheItem = item_mod.CacheItem;
 const safety_mod = @import("cleanup/safety.zig");
 const SafetyLevel = safety_mod.SafetyLevel;
-const trash_mod = @import("cleanup/trash.zig");
-const TrashManager = trash_mod.TrashManager;
 
-const row_h = 30;
+const row_h = 26;
+const header_h = 26;
 
-const Column = struct { title: []const u8, width: ?f32 = null };
+const Column = struct {
+    title: []const u8,
+    width: ?f32 = null,
+    right: bool = false,
+    sort: ?CleanupSort = null,
+};
 
 const columns = [_]Column{
-    .{ .title = "Name", .width = null },
-    .{ .title = "Location", .width = 180 },
-    .{ .title = "Size", .width = 90 },
-    .{ .title = "Safety", .width = 80 },
+    .{ .title = "Name", .sort = .name },
+    .{ .title = "Kind", .width = 96 },
+    .{ .title = "Where", .width = 150 },
+    .{ .title = "Size", .width = 90, .right = true, .sort = .size },
+    .{ .title = "Safety", .width = 76, .sort = .safety },
 };
 
 fn cell(c: *ui.Context, col: Column, h: f32) ui.Div {
     var d = ui.div(c).row().h(h).itemsCenter().px(10).clip();
-    d = if (col.width) |w| d.w(w).justifyEnd() else d.grow().w(0);
+    d = if (col.width) |w| d.w(w) else d.grow().w(0);
+    if (col.right) d = d.justifyEnd();
     return d;
+}
+
+fn divider(c: *ui.Context, k: theme.Colors) void {
+    _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .{ .px = 14 }, .background = k.separator }, .none, null);
 }
 
 fn safetyColor(level: SafetyLevel, k: theme.Colors) ui.Color {
@@ -41,202 +54,364 @@ fn safetyColor(level: SafetyLevel, k: theme.Colors) ui.Color {
     };
 }
 
-fn safetyLabel(level: SafetyLevel) []const u8 {
-    return switch (level) {
-        .safe => "Safe",
-        .medium => "Review",
-        .unknown => "Unknown",
+/// What the Kind column says: a file's kind is what it is (a disk image, a
+/// virtual machine), everything else is where it came from.
+fn kindLabel(item: *CacheItem) []const u8 {
+    return item.kind();
+}
+
+/// The symbol a row carries when it is not an app: one per kind of thing.
+pub fn kindIcon(category: item_mod.Category) []const u8 {
+    return switch (category) {
+        .cache => "internaldrive",
+        .junk => "doc.text",
+        .dev => "chevron.left.forwardslash.chevron.right",
+        .project => "folder",
+        .large => "doc",
+        .app => "app.badge",
+        .simulator => "cube",
+        .xcode => "wrench.and.screwdriver",
+        .brew => "gearshape",
+        .other => "folder",
     };
 }
 
-pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
-    {
-        const h = kit.header(c, k, "Cleanup", "Scan and delete app caches");
-        defer h.end();
-        // Scan button temporarily disabled
-        // const scan = ui.div(c).row().h(28).itemsCenter().gap(8).control();
-        // defer scan.end();
-        // if (scan.clicked()) {
-        //     a.cleanup_scanning = true;
-        //     a.cleanup_scan_phase = 0;
-        // }
-        // ui.text(c, "Scan", .{ .size = 12.5, .weight = .medium, .color = k.text });
-    }
-    {
-        const h = ui.div(c).row().wFull().h(28).itemsCenter().px(10);
-        defer h.end();
-        for (columns, 0..) |col, i| {
-            if (i > 0) _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .{ .px = 14 }, .background = k.separator }, .none, null);
-            ui.key(c, col.title);
-            const d = cell(c, col, 28).gap(4);
-            defer d.end();
-            ui.text(c, col.title, .{ .size = 11.5, .weight = .semibold, .color = k.secondary });
+/// A row's icon at the left of its name: an app's own icon when it is one
+/// (and macOS will give it), a symbol for its kind otherwise.
+pub fn rowIcon(c: *ui.Context, a: *App, k: theme.Colors, item: *CacheItem, size: f32) void {
+    const box = ui.div(c).row().w(size).h(size).center();
+    defer box.end();
+    if (item.category == .app) {
+        const bundle = item.primaryPath();
+        if (a.icons.get(bundle)) |png| {
+            _ = ui.image(c, .{ .key = bundle, .bytes = png, .max_width = size, .max_height = size, .radius = 0 });
+            return;
         }
     }
-    // Scan phase temporarily disabled
-    // if (a.cleanup_scanning) {
-    //     var scanner = CacheScanner.init(a.sampler.gpa, a.sampler.io) catch {
-    //         a.cleanup_scanning = false;
-    //         return;
-    //     };
-    //     defer scanner.deinit();
-    //
-    //     switch (a.cleanup_scan_phase) {
-    //         0 => {
-    //             // Phase 0: Scan Library Caches
-    //             if (scanner.scanLibraryCaches()) |items| {
-    //                 a.cleanup_items.appendSlice(a.sampler.gpa, items.items) catch {};
-    //             } else |_| {}
-    //             a.cleanup_scan_phase = 1;
-    //             if (a.window) |w| w.redraw();
-    //         },
-    //         1 => {
-    //             // Phase 1: Scan Application Support
-    //             if (scanner.scanApplicationSupport()) |items| {
-    //                 a.cleanup_items.appendSlice(a.sampler.gpa, items.items) catch {};
-    //             } else |_| {}
-    //             a.cleanup_scan_phase = 2;
-    //             if (a.window) |w| w.redraw();
-    //         },
-    //         2 => {
-    //             // Phase 2: Scan Dev Tools
-    //             if (scanner.scanDevTools()) |items| {
-    //                 a.cleanup_items.appendSlice(a.sampler.gpa, items.items) catch {};
-    //             } else |_| {}
-    //             a.cleanup_scan_phase = 3;
-    //             a.cleanup_scanning = false;
-    //             if (a.window) |w| w.redraw();
-    //         },
-    //         3 => {
-    //             // Done
-    //             a.cleanup_scanning = false;
-    //         },
-    //         else => {
-    //             // Invalid phase, reset
-    //             a.cleanup_scanning = false;
-    //             a.cleanup_scan_phase = 0;
-    //         },
-    //     }
-    // }
-    // Render items
-    if (a.cleanup_items.items.len == 0) {
-        const empty = ui.div(c).column().wFull().grow().center().gap(10);
-        defer empty.end();
-        ui.text(c, "Scan functionality temporarily disabled", .{ .size = 13, .color = k.secondary });
-        ui.text(c, "UI blocking issue - using async pattern required", .{ .size = 11.5, .color = k.tertiary });
-    } else {
-        for (a.cleanup_items.items, 0..) |item, i| {
-            const row = ui.div(c).row().wFull().h(row_h).itemsCenter();
-            defer row.end();
+    ui.icon(c, kindIcon(item.category), .{ .size = size * 0.72, .color = kit.tabColor(item.category.tab(), k) });
+}
 
-            // Checkbox for selection
-            const selected = a.cleanup_selected.get(i) != null;
-            const checkbox = ui.div(c).w(20).h(20).center().control();
-            defer checkbox.end();
-            if (checkbox.clicked()) {
-                if (selected) {
-                    _ = a.cleanup_selected.swapRemove(i);
-                } else {
-                    a.cleanup_selected.put(a.sampler.gpa, i, {}) catch {};
-                }
+/// The tick at a row's start: the accent when ticked, an outline when not.
+fn tick(c: *ui.Context, k: theme.Colors, on: bool) void {
+    const box = ui.div(c).row().w(13).h(13).center().rounded(3);
+    const styled = if (on) box.bg(k.accent) else box.border(k.border);
+    defer styled.end();
+    if (on) ui.icon(c, "checkmark", .{ .size = 8, .weight = .bold, .color = k.on_picked });
+}
+
+pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
+    // The first time the page is opened it looks around on its own, the way
+    // purge does; Scan asks again.
+    if (a.cleanup_auto and !a.cleanup_scanning and !a.cleanup_scanned) a.startCleanupScan();
+    // The disk map's rows are the Overview page's; there is no tab for them.
+    if (a.cleanup_tab == .overview) a.cleanupSetTab(.caches);
+    const root = ui.div(c).column().wFull().grow().hFull();
+    defer root.end();
+    head(c, a, k);
+    _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.separator }, .none, null);
+    columnsHeader(c, a, k);
+    _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.separator }, .none, null);
+    list(c, a, k);
+    footer(c, a, k);
+}
+
+fn head(c: *ui.Context, a: *App, k: theme.Colors) void {
+    var b: [32]u8 = undefined;
+    const totals = a.cleanupTabTotals(a.cleanup_tab);
+    const sub = if (a.cleanup_scanning)
+        if (a.cleanupProgress() == 0)
+            a.cleanup_tab.subtitle()
+        else
+            c.print("Scanning… {d} of {d} done", .{ a.cleanupProgress(), app_mod.cleanup_pass_count })
+    else if (totals.count == 0)
+        a.cleanup_tab.subtitle()
+    else if (a.cleanup_visible.items.len != totals.count)
+        c.print("{d} of {d} shown · {s}{s}", .{ a.cleanup_visible.items.len, totals.count, if (a.cleanupApprox()) "≈ " else "", item_mod.formatBytes(a.cleanupVisibleBytes(), &b) })
+    else
+        c.print("{d} found · {s}{s}", .{ totals.count, if (a.cleanupApprox()) "≈ " else "", item_mod.formatBytes(totals.bytes, &b) });
+    const h = kit.header(c, k, a.cleanup_tab.title(), sub);
+    defer h.end();
+    if (totals.count > 0) {
+        const filters = [_]CleanupFilter{ .all, .safe, .check };
+        var names: [filters.len][]const u8 = undefined;
+        for (filters, 0..) |f, i| names[i] = f.title();
+        if (kit.segmented(c, k, &names, @backingInt(a.cleanup_filter))) |i| {
+            a.cleanupSetFilter(filters[i]);
+            if (a.window) |w| w.redraw();
+        }
+    }
+    if (ui.button(c, if (a.cleanup_scanning) "Scanning…" else "Scan", .{
+        .variant = .primary,
+        .size = 12,
+        .icon = "arrow.clockwise",
+        .disabled = a.cleanup_scanning or a.cleanup_removing,
+    }).clicked) a.startCleanupScan();
+}
+
+fn columnsHeader(c: *ui.Context, a: *App, k: theme.Colors) void {
+    const h = ui.div(c).row().wFull().h(header_h).itemsCenter();
+    defer h.end();
+    {
+        const box = ui.div(c).row().w(30).center().control();
+        defer box.end();
+        if (box.clicked() and a.cleanup_visible.items.len > 0) {
+            a.cleanupToggleAll();
+            if (a.window) |w| w.redraw();
+        }
+        tick(c, k, a.cleanupAllSelected());
+    }
+    for (columns, 0..) |col, i| {
+        if (i > 0) divider(c, k);
+        var d = cell(c, col, header_h).gap(4);
+        if (col.sort) |sort| {
+            d = d.control().hover(k.hover);
+            if (d.clicked()) {
+                a.cleanupSortBy(sort);
                 if (a.window) |w| w.redraw();
             }
-            if (selected) {
-                _ = c.leaf(.{ .width = .{ .px = 14 }, .height = .{ .px = 14 }, .background = k.accent }, .none, null);
-            } else {
-                _ = c.leaf(.{ .width = .{ .px = 14 }, .height = .{ .px = 14 }, .background = k.border }, .none, null);
+        }
+        defer d.end();
+        const on = if (col.sort) |sort| a.cleanup_sort == sort else false;
+        ui.text(c, col.title, .{ .size = 11.5, .weight = if (on) .semibold else .regular, .color = if (on) k.text else k.secondary });
+        if (on) ui.icon(c, if (a.cleanup_ascending) "chevron.up" else "chevron.down", .{ .size = 8, .weight = .bold, .color = k.secondary });
+    }
+}
+
+fn list(c: *ui.Context, a: *App, k: theme.Colors) void {
+    if (a.cleanup_visible.items.len == 0) {
+        const empty = ui.div(c).column().wFull().grow().center().gap(8);
+        defer empty.end();
+        if (a.cleanup_scanning) {
+            ui.text(c, "Scanning…", .{ .size = 13, .color = k.text });
+            ui.text(c, a.cleanup_tab.subtitle(), .{ .size = 11.5, .color = k.tertiary });
+        } else if (a.cleanup_scan_failed.load(.acquire)) {
+            ui.text(c, "The scan could not start", .{ .size = 13, .color = k.text });
+            ui.text(c, "Try again in a moment", .{ .size = 11.5, .color = k.tertiary });
+        } else if (a.cleanupTabTotals(a.cleanup_tab).count == 0) {
+            const words = switch (a.cleanup_tab) {
+                .overview => .{ "Nothing measured yet", "Press Scan to see where the space went" },
+                .caches => .{ "Nothing to clean here", "Caches, logs and system junk show up here" },
+                .dev => .{ "No build folders found", "Tool caches and project build folders show up here" },
+                .large => .{ "No large files found", "Files over 100 MB in your folders show up here" },
+                .uninstall => .{ "No apps found", "The apps in Applications show up here" },
+            };
+            ui.text(c, words[0], .{ .size = 13, .color = k.text });
+            ui.text(c, words[1], .{ .size = 11.5, .color = k.tertiary });
+        } else {
+            ui.text(c, "Nothing here", .{ .size = 13, .color = k.text });
+            ui.text(c, "No items match this filter", .{ .size = 11.5, .color = k.tertiary });
+        }
+        return;
+    }
+    var rows = ui.list(c, .{ .count = a.cleanup_visible.items.len, .row_height = row_h });
+    while (rows.next()) |i| row(c, a, k, a.cleanup_visible.items[i], i);
+    rows.end();
+}
+
+fn row(c: *ui.Context, a: *App, k: theme.Colors, item: *CacheItem, i: usize) void {
+    const on = a.cleanupIsSelected(item);
+    var r = ui.div(c).row().wFull().h(row_h).itemsCenter().control();
+    if (i % 2 == 1) r = r.bg(k.stripe);
+    if (on) r = r.bg(k.marked);
+    r = r.hover(k.hover);
+    defer r.end();
+    const it = r.interaction();
+    if (it.clicked) {
+        a.cleanupToggle(item);
+        if (a.window) |w| w.redraw();
+    }
+
+    {
+        const box = ui.div(c).row().w(30).center();
+        defer box.end();
+        tick(c, k, on);
+    }
+    {
+        const name_cell = cell(c, columns[0], row_h).gap(7);
+        defer name_cell.end();
+        rowIcon(c, a, k, item, 16);
+        ui.text(c, item.app_name, .{ .size = 12.5, .color = k.text });
+        // An app is more than its bundle: say how much more is coming with it.
+        if (item.locations.items.len > 1) {
+            ui.text(c, c.print("+{d}", .{item.locations.items.len - 1}), .{ .size = 10.5, .color = k.tertiary });
+        }
+        if (item.safety_info.reinstall_command != null) ui.icon(c, "chevron.left.forwardslash.chevron.right", .{ .size = 9, .color = k.tertiary });
+    }
+    divider(c, k);
+    {
+        const kind_cell = cell(c, columns[1], row_h);
+        defer kind_cell.end();
+        ui.text(c, kindLabel(item), .{ .size = 11.5, .color = k.secondary });
+    }
+    divider(c, k);
+    {
+        const where_cell = cell(c, columns[2], row_h);
+        defer where_cell.end();
+        const where = if (item.locations.items.len > 0) item.locations.items[0].folder_name else "";
+        ui.text(c, where, .{ .size = 11.5, .color = k.tertiary });
+    }
+    divider(c, k);
+    {
+        const size_cell = cell(c, columns[3], row_h);
+        defer size_cell.end();
+        var buf: [32]u8 = undefined;
+        if (!item.measured) {
+            ui.text(c, "—", .{ .size = 11.5, .mono = true, .color = k.tertiary });
+        } else ui.text(c, c.print("{s}{s}", .{ if (item.approx()) "≈ " else "", item.formatSize(&buf) }), .{ .size = 11.5, .mono = true, .color = k.text });
+    }
+    divider(c, k);
+    {
+        const safety_cell = cell(c, columns[4], row_h).gap(5);
+        defer safety_cell.end();
+        const color = safetyColor(item.safety_info.level, k);
+        _ = c.leaf(.{ .width = .{ .px = 6 }, .height = .{ .px = 6 }, .radius = 3, .background = color }, .none, null);
+        ui.text(c, item.safety_info.level.shortName(), .{ .size = 11.5, .color = color });
+    }
+}
+
+fn footer(c: *ui.Context, a: *App, k: theme.Colors) void {
+    const count = a.cleanup_selected.count();
+    const notice = a.cleanup_notice;
+    if (count == 0 and notice == null) return;
+    _ = c.leaf(.{ .width = .fill, .height = .{ .px = 1 }, .background = k.separator }, .none, null);
+    const bar = ui.div(c).column().wFull().gap(6).p(12).bg(k.card);
+    defer bar.end();
+    if (count > 0) {
+        {
+            const r = ui.div(c).row().wFull().itemsCenter().gap(10);
+            defer r.end();
+            var buf: [32]u8 = undefined;
+            _ = c.leaf(.{ .width = .{ .px = 8 }, .height = .{ .px = 8 }, .radius = 2, .background = k.accent }, .none, null);
+            ui.text(c, c.print("{d} ticked", .{count}), .{ .size = 12.5, .weight = .semibold, .color = k.text });
+            ui.text(c, c.print("{s}", .{item_mod.formatBytes(a.cleanupSelectedBytes(), &buf)}), .{ .size = 11.5, .mono = true, .color = k.secondary });
+            ui.spacer(c);
+            if (ui.button(c, "Clear", .{ .variant = .ghost, .size = 12, .disabled = a.cleanup_removing }).clicked) {
+                a.cleanup_selected.clearRetainingCapacity();
+                if (a.window) |w| w.redraw();
             }
-
-            // Name
-            _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .{ .px = 14 }, .background = k.separator }, .none, null);
-            const name_cell = cell(c, columns[0], row_h);
-            defer name_cell.end();
-            ui.text(c, item.app_name, .{ .size = 12.5, .color = k.text });
-
-            // Location
-            _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .{ .px = 14 }, .background = k.separator }, .none, null);
-            // Size
-            _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .{ .px = 14 }, .background = k.separator }, .none, null);
-            const size_cell = cell(c, columns[2], row_h);
-            defer size_cell.end();
-            var size_buf: [32]u8 = undefined;
-            ui.text(c, item.formatSize(&size_buf), .{ .size = 11.5, .color = k.secondary });
-
-            // Safety
-            _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .{ .px = 14 }, .background = k.separator }, .none, null);
-            const safety_cell = cell(c, columns[3], row_h);
-            defer safety_cell.end();
-            const safety_color = safetyColor(item.safety_info.level, k);
-            _ = c.leaf(.{ .width = .{ .px = 6 }, .height = .{ .px = 6 }, .background = safety_color }, .none, null);
-            ui.text(c, safetyLabel(item.safety_info.level), .{ .size = 11.5, .color = safety_color });
+            const label = if (a.cleanup_removing) "Removing…" else c.print("{s}…", .{a.cleanupSelectionVerb()});
+            if (ui.button(c, label, .{ .variant = .primary, .size = 12, .icon = "trash", .disabled = a.cleanup_removing }).clicked) {
+                a.cleanup_confirm = true;
+                if (a.window) |w| w.redraw();
+            }
         }
-    }
-
-    // Delete button (at bottom)
-    if (a.cleanup_selected.count() > 0) {
-        const footer = ui.div(c).row().wFull().h(44).itemsCenter().px(10).gap(10);
-        defer footer.end();
-        const delete = ui.div(c).row().h(28).itemsCenter().px(12).rounded(6).control();
-        defer delete.end();
-        if (delete.clicked()) {
-            a.cleanup_confirm = true;
-            if (a.window) |w| w.redraw();
-        }
-        ui.text(c, "Delete Selected", .{ .size = 12.5, .weight = .medium, .color = k.text });
-        var count_buf: [32]u8 = undefined;
-        const count_str = std.fmt.bufPrint(&count_buf, "{d} items", .{a.cleanup_selected.count()}) catch "0 items";
-        ui.text(c, count_str, .{ .size = 11.5, .color = k.secondary });
-    }
-
-    // Confirmation sheet
-    if (a.cleanup_confirm) {
-        const sheet = ui.div(c).column().w(300).center().gap(12).rounded(12);
-        defer sheet.end();
-        ui.text(c, "Delete Selected Items?", .{ .size = 14, .weight = .semibold, .color = k.text });
-        ui.text(c, "Items will be moved to Trash.", .{ .size = 12, .color = k.secondary });
-        const buttons = ui.div(c).row().wFull().gap(8);
-        defer buttons.end();
-        const cancel = ui.div(c).row().h(28).itemsCenter().px(12).rounded(6).control();
-        defer cancel.end();
-        if (cancel.clicked()) {
-            a.cleanup_confirm = false;
-            if (a.window) |w| w.redraw();
-        }
-        ui.text(c, "Cancel", .{ .size = 12.5, .weight = .medium, .color = k.text });
-        const confirm = ui.div(c).row().h(28).itemsCenter().px(12).rounded(6).control();
-        defer confirm.end();
-        if (confirm.clicked()) {
-            // Delete selected items
-            var trash = TrashManager.init(a.sampler.gpa, a.sampler.io) catch return;
-            defer trash.deinit();
-
+        if (count == 1) {
             var it = a.cleanup_selected.iterator();
-            while (it.next()) |entry| {
-                const idx = entry.key_ptr.*;
-                if (idx < a.cleanup_items.items.len) {
-                    const item = a.cleanup_items.items[idx];
-                    for (item.locations.items) |loc| {
-                        trash.moveToTrash(loc.path) catch {};
-                    }
-                }
-            }
-
-            // Clear selected items from list
-            var keep: usize = 0;
-            for (a.cleanup_items.items, 0..) |item, i| {
-                if (a.cleanup_selected.get(i) == null) {
-                    a.cleanup_items.items[keep] = item;
-                    keep += 1;
-                } else {
-                    item.deinit();
-                    a.sampler.gpa.destroy(item);
-                }
-            }
-            a.cleanup_items.shrinkRetainingCapacity(keep);
-            a.cleanup_selected.clearRetainingCapacity();
-            a.cleanup_confirm = false;
+            if (it.next()) |entry| explain(c, k, entry.key_ptr.*);
+        }
+    }
+    if (notice) |text| {
+        const r = ui.div(c).row().wFull().itemsCenter().gap(8);
+        defer r.end();
+        ui.icon(c, if (a.cleanup_notice_error) "exclamationmark.triangle.fill" else "checkmark.circle.fill", .{
+            .size = 13,
+            .color = if (a.cleanup_notice_error) k.orange else k.green,
+        });
+        ui.text(c, text, .{ .size = 12, .color = k.text });
+        ui.spacer(c);
+        if (ui.button(c, "Dismiss", .{ .variant = .ghost, .size = 12 }).clicked) {
+            a.clearCleanupNotice();
             if (a.window) |w| w.redraw();
         }
-        ui.text(c, "Delete", .{ .size = 12.5, .weight = .medium, .color = k.text });
     }
+}
+
+/// One ticked row's plain-language story: what it is, and what brings it back.
+fn explain(c: *ui.Context, k: theme.Colors, item: *CacheItem) void {
+    const lines = ui.div(c).column().wFull().gap(2);
+    defer lines.end();
+    ui.text(c, c.print("{s} — {s}", .{ item.safety_info.headline, item.safety_info.explanation }), .{ .size = 11.5, .color = k.secondary, .wrap = true });
+    if (item.safety_info.reinstall_command) |cmd| {
+        ui.text(c, cmd, .{ .size = 11, .mono = true, .color = k.tertiary });
+    } else {
+        ui.text(c, item.safety_info.recovery_steps, .{ .size = 11, .color = k.tertiary, .wrap = true });
+    }
+}
+
+/// Where the space went, as the Overview page shows it beside the machine's
+/// tiles: the disk's own figures, what each Cleanup tab found, and the user's
+/// own folders. A Cleanup row opens that tab; nothing here moves a file.
+pub fn space(c: *ui.Context, a: *App, k: theme.Colors) void {
+    var b0: [32]u8 = undefined;
+    var b1: [32]u8 = undefined;
+    var b2: [32]u8 = undefined;
+    const card = kit.card(c, k);
+    defer card.end();
+    {
+        const t = kit.title(c, "internaldrive", "Space", k.orange);
+        defer t.end();
+        if (a.cleanup_volume) |disk| {
+            ui.text(c, c.print("Used {s} of {s} · {s} free", .{
+                item_mod.formatBytes(disk.used, &b0),
+                item_mod.formatBytes(disk.total, &b1),
+                item_mod.formatBytes(disk.free, &b2),
+            }), .{ .size = 11, .mono = true, .color = k.secondary });
+        } else if (a.cleanup_scanning) {
+            ui.text(c, "Measuring…", .{ .size = 11, .color = k.secondary });
+        }
+        if (ui.button(c, if (a.cleanup_scanning) "Scanning…" else "Scan", .{
+            .variant = .secondary,
+            .size = 11.5,
+            .icon = "arrow.clockwise",
+            .disabled = a.cleanup_scanning or a.cleanup_removing,
+        }).clicked) a.startCleanupScan();
+    }
+    if (a.cleanup_volume) |disk| {
+        kit.bar(c, k, @as(f32, @floatFromInt(disk.used)) / @as(f32, @floatFromInt(@max(1, disk.total))), k.accent);
+    }
+    {
+        const halves = ui.div(c).row().wFull().gap(24).itemsStart();
+        defer halves.end();
+        // Left: what Cleanup found, one row per tab, each a click away.
+        {
+            const col = ui.div(c).column().grow().w(0).gap(3);
+            defer col.end();
+            ui.text(c, "What Cleanup found", .{ .size = 11, .weight = .semibold, .color = k.tertiary });
+            const tabs = [_]CleanupTab{ .caches, .dev, .large, .uninstall };
+            for (tabs) |tab| {
+                const totals = a.cleanupTabTotals(tab);
+                ui.key(c, c.print("space-{s}", .{tab.title()}));
+                const line = ui.div(c).row().wFull().h(20).itemsCenter().gap(8).px(4).rounded(5).hover(k.hover).control();
+                defer line.end();
+                if (line.clicked()) {
+                    a.page = .cleanup;
+                    a.cleanupSetTab(tab);
+                }
+                kit.chip(c, tab.icon(), kit.tabColor(tab, k), 18, false);
+                ui.text(c, tab.title(), .{ .size = 12, .color = k.text });
+                ui.spacer(c);
+                if (totals.count == 0) {
+                    ui.text(c, "—", .{ .size = 11.5, .mono = true, .color = k.tertiary });
+                } else {
+                    ui.text(c, c.print("{d} · {s}", .{ totals.count, item_mod.formatBytes(totals.bytes, &b0) }), .{ .size = 11.5, .mono = true, .color = k.secondary });
+                }
+                ui.icon(c, "chevron.right", .{ .size = 9, .weight = .semibold, .color = k.tertiary });
+            }
+        }
+        // Right: the user's own folders, as the disk map measured them.
+        {
+            const col = ui.div(c).column().grow().w(0).gap(3);
+            defer col.end();
+            ui.text(c, "Your folders", .{ .size = 11, .weight = .semibold, .color = k.tertiary });
+            var most: u64 = 1;
+            for (a.cleanup_items.items) |item| {
+                if (item.category == .other) most = @max(most, item.sizeBytes());
+            }
+            var shown: usize = 0;
+            for (a.cleanup_items.items) |item| {
+                if (item.category != .other) continue;
+                shown += 1;
+                const line = ui.div(c).row().wFull().h(20).itemsCenter().gap(8);
+                defer line.end();
+                ui.text(c, item.app_name, .{ .size = 12, .color = k.text });
+                ui.spacer(c);
+                const bar_box = ui.div(c).row().w(90);
+                defer bar_box.end();
+                kit.bar(c, k, @as(f32, @floatFromInt(item.sizeBytes())) / @as(f32, @floatFromInt(most)), k.blue);
+                ui.text(c, c.print("{s}{s}", .{ if (item.approx()) "≈ " else "", item.formatSize(&b1) }), .{ .size = 11.5, .mono = true, .color = k.secondary });
+            }
+            if (shown == 0) ui.text(c, if (a.cleanup_scanning) "Measuring…" else "Nothing measured yet", .{ .size = 11.5, .color = k.tertiary });
+        }
+    }
+    ui.text(c, "Nothing here moves a file: the Cleanup pages do that, and this only says where the space went.", .{ .size = 11, .color = k.tertiary });
 }

@@ -13,6 +13,18 @@ const App = app_mod.App;
 
 pub const header_h = 52;
 
+/// The color of a Cleanup tab's chip: the same in the sidebar, on the
+/// Overview's Space card and beside a row's icon.
+pub fn tabColor(tab: app_mod.CleanupTab, k: theme.Colors) ui.Color {
+    return switch (tab) {
+        .overview => k.gray,
+        .caches => k.orange,
+        .dev => k.purple,
+        .large => k.blue,
+        .uninstall => k.red,
+    };
+}
+
 /// The page's title and what it is about; add controls, then `end`.
 pub fn header(c: *ui.Context, k: theme.Colors, name: []const u8, subtitle: []const u8) ui.Div {
     const h = ui.div(c).row().wFull().h(header_h).itemsCenter().gap(8).px(20);
@@ -117,7 +129,7 @@ pub fn ranges(c: *ui.Context, a: *App, k: theme.Colors) void {
     const all = [_]app_mod.Range{ .m1, .m5, .m15, .h1 };
     var names: [all.len][]const u8 = undefined;
     for (all, 0..) |r, i| names[i] = r.title();
-    if (segmented(c, k, &names, @intFromEnum(a.range))) |i| a.range = all[i];
+    if (segmented(c, k, &names, @backingInt(a.range))) |i| a.range = all[i];
     ui.key(c, "pause");
     const d = ui.div(c).row().w(30).h(26).center().rounded(8).bg(k.control).hover(k.hover).control();
     defer d.end();

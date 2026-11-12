@@ -97,6 +97,33 @@ zig build run --fork=../..
   helpers), with summed CPU, memory and threads.
 - **About This Mac:** chip, cores, graphics, memory, system and uptime.
 
+### Cleanup
+
+The sidebar's Cleanup section, above System, has four tabs:
+
+- **App Caches:** what apps leave behind — caches, logs, crash reports, saved
+  window state, Time Machine's local snapshots.
+- **Dev Tools:** caches tools keep for every project (npm, Go, Xcode,
+  Homebrew, Docker…), and the rebuildable folder inside each project the walk
+  finds (`node_modules`, `target`, `.venv`, `Pods`…), plus the simulator
+  runtimes and devices Xcode keeps, Xcode's optional components, and
+  Homebrew's command-line tools.
+- **Large Files:** the biggest files in your own folders, with what each one
+  is — a disk image, a virtual machine, an AI model, a video.
+- **App Uninstaller:** an app in Applications with everything it left in your
+  Library, so one move takes all of it. Apps Homebrew installed go through
+  `brew uninstall --cask` instead.
+
+Where the space went lives on the machine's own **Overview** page: a Space
+card with the disk's figures, what each Cleanup tab found (a click opens that
+tab), and the size of your folders. It is read-only.
+
+Sort by size, filter by safety, tick rows, and move them to the Trash
+together. Almost everything goes to the Trash; the few things only a tool can
+take away (a simulator, an Xcode component, a Homebrew package, a Time Machine
+snapshot) say so before they go. Apple's own apps are never offered, and
+caches holding accounts, passwords or system UI are refused outright.
+
 Graphs span 1 minute to 1 hour, and you can pause them. Hover a graph to read
 the values in any column.
 
@@ -184,6 +211,11 @@ Apple's private interfaces.
 ## Using it
 
 - **Pages**: click the sidebar, or press ⌘1 to ⌘9.
+- **Cleanup**: ⌘9, then ⌘R to scan. The four tabs are in the sidebar. Click a
+  row to tick it; the box in the header ticks everything the filter shows.
+  The button says what will happen — Move to Trash…, Uninstall…, Delete… or
+  Remove… — and the sheet names the items first. What went to the Trash can be
+  put back from there.
 - **Pause**: the ⏸ button beside the range, or ⇧⌘P.
 - **Sort**: click a column; click it again to reverse the order.
 - **Search**: ⌘F, then type. Any of the words shows a process with it in
@@ -219,7 +251,7 @@ src/sample_iokit_mac.zig the disks and the GPU, from IOKit
 src/sample_temp_mac.zig  temperatures, from IOKit's HID sensors
 src/sample_sys_linux.zig the same from /proc
 src/view.zig          the window: sidebar, page, sheets, keys
-src/view_side.zig     the sidebar
+src/view_side.zig     the sidebar, with Cleanup and its tabs above System
 src/view_kit.zig      headers, cards, figures, bars, ranges, the cell graph
 src/view_overview.zig the overview
 src/view_procs.zig    the processes page
@@ -228,11 +260,27 @@ src/view_cpu.zig      CPU
 src/view_memory.zig   memory and GPU
 src/view_io.zig       disk and network
 src/view_apps.zig     apps
+src/cleanup/safety.zig   what may be cleaned: the safety tiers and catalogs
+src/cleanup/item.zig     a scanned item, its locations, category and tab
+src/cleanup/measure.zig  measuring a file or folder, bounded
+src/cleanup/scanner.zig  the scan: caches, junk, dev caches, projects
+src/cleanup/large.zig    the large files in the user's own folders
+src/cleanup/apps.zig     installed apps and what they left behind
+src/cleanup/simulators.zig simulator runtimes and devices, through simctl
+src/cleanup/xcode.zig    Xcode's optional components
+src/cleanup/brew.zig     what Homebrew installed: casks and formulae
+src/cleanup/snapshots.zig Time Machine's local snapshots
+src/cleanup/diskmap.zig  the overview: the disk and the user's folders
+src/cleanup/remove.zig   how each kind of item is removed
+src/cleanup/exec.zig     running a short command off the UI thread
+src/cleanup/trash.zig    moving to the Trash (macOS and freedesktop)
+src/view_cleanup.zig  the Cleanup page and its four tabs
 src/view_about.zig    About This Mac
 src/view_sheet.zig    the filter menu, the search's examples, the inspector, the quit sheets
 src/view_graff.zig    the graff bubble and what it tells graff
 src/graff.zig         running graff one-shot, reading its answer
 src/tests_select.zig  marking, quitting together, the bubble (a fake graff)
+src/tests_cleanup.zig the Cleanup page and the move, through the Tester
 src/theme.zig         the colors, light and dark
 src/tests.zig         tests
 src/tests_menubar.zig the panel and the readout

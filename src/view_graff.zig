@@ -25,9 +25,11 @@ extern "c" fn getpid() c_int;
 pub fn bubble(c: *ui.Context, a: *App, k: theme.Colors) void {
     const g = &a.graff;
     // Over the page, not in its way: only the panel and button take the
-    // pointer. Above the Processes page's bar when it shows.
-    const bar = a.page == .processes and (a.markedSummary().count > 0 or a.noticeText() != null);
-    const layer = ui.div(c).absolute().sizeFull().column().itemsEnd().justifyEnd().gap(12).px(18).pb(if (bar) 18 + 51 else 18);
+    // pointer. Above the bars the Processes and Cleanup pages show.
+    const process_bar = a.page == .processes and (a.markedSummary().count > 0 or a.noticeText() != null);
+    const cleanup_bar = a.page == .cleanup and (a.cleanup_selected.count() > 0 or a.cleanup_notice != null);
+    const lift: f32 = if (cleanup_bar) 124 else if (process_bar) 51 else 0;
+    const layer = ui.div(c).absolute().sizeFull().column().itemsEnd().justifyEnd().gap(12).px(18).pb(18 + lift);
     defer layer.end();
     if (g.open) panel(c, a, k);
     ui.key(c, "graff-bubble");

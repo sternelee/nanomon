@@ -16,6 +16,9 @@ const App = app_mod.App;
 const mini_h = 64;
 
 pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
+    // The space card is worth filling in from the start: the first time the
+    // app is opened, Cleanup looks around on its own, the way purge does.
+    if (a.cleanup_auto and !a.cleanup_scanning and !a.cleanup_scanned) a.startCleanupScan();
     const s = &a.sampler;
     const sy = s.system;
     var b: [4][32]u8 = undefined;
@@ -50,10 +53,15 @@ pub fn page(c: *ui.Context, a: *App, k: theme.Colors) void {
         kit.dots(c, k, a, &.{ .{ .values = s.in_history.slice(), .color = k.teal }, .{ .values = s.out_history.slice(), .color = k.blue } }, null, mini_h, false, null);
         c.end();
     }
-    const r = ui.div(c).row().wFull().gap(14).itemsStart();
-    defer r.end();
-    busiest(c, a, k);
-    machine(c, a, k);
+    {
+        const r = ui.div(c).row().wFull().gap(14).itemsStart();
+        defer r.end();
+        busiest(c, a, k);
+        machine(c, a, k);
+    }
+    // Where the space went, and what Cleanup would find: the top-level
+    // Overview carries it, rather than a tab of its own.
+    @import("view_cleanup.zig").space(c, a, k);
 }
 
 /// Opens a tile: its chip, name, figure and note; the caller adds its

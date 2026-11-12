@@ -49,6 +49,79 @@ Key implementation details:
 - If the external command fails or crashes, the feature degrades gracefully (empty data)
 - The pattern requires a `Notify` callback struct with `ctx: *anyopaque` and `func: *const fn (*anyopaque) void`
 
+## Cleanup Feature
+
+Cleanup is its own sidebar section above System, with four tabs: App Caches,
+Dev Tools, Large Files and App Uninstaller (⌘9 opens it). It finds space the
+machine is done with and removes it — nearly all of it to the Trash, the
+tool-owned things through their own tool. Its design follows `purge-app` (an
+external reference project, not a dependency): a scan only proposes paths, and
+a safety catalog decides what may be offered.
+
+The "where did the space go" view is **not** a Cleanup tab: it is the Space
+card at the foot of the machine's own Overview page (`view_overview.zig` calls
+`view_cleanup.space`). It shows the disk's figures, each tab's total (a click
+opens that tab) and the user's folders, and it removes nothing.
+
+- `src/cleanup/safety.zig` — the three safety tiers, the catalogs (safe app
+  caches, system junk, dev caches, project rules), and the deny lists for
+  identity/keychain, system UI and endpoint-security caches. A rule can only
+  narrow what the deny lists allow; `unknown` never reaches the UI.
+- `src/cleanup/item.zig` — `Category` (where an item came from), `Tab` (which
+  page it belongs to) and `Removal` (how it goes). `Category.tab()` and
+  `Removal.verb()` are the only mappings; `measured` means "the page may show
+  a size" and `sized` means "already measured, do not walk it again".
+- `src/cleanup/scanner.zig` — thirteen passes (app caches, junk, dev caches,
+  Application Support, large files, apps, projects, simulators, Xcode
+  components, brew casks, brew formulae, snapshots, disk map). `scanAll` runs
+  them together; the app runs them one at a time. Size walks run on up to ten
+  threads (capped by the core count), each with its own `std.Io` and
+  `std.heap.smp_allocator`; each item is measured by exactly one thread, and
+  an app's bundle and Library folders are measured one by one. `initAt` scans
+  a home of its own with `machine = false`, so tests never read the real
+  machine's simulators, Homebrew list, snapshots or disk.
+- `src/cleanup/measure.zig` — `measureAt`: a file is its size, a folder is
+  what it holds, bounded by a file limit (past it, the size is a floor).
+- `src/cleanup/large.zig` — files over 100 MB in the user's own folders.
+- `src/cleanup/apps.zig` — app bundles in `/Applications` and
+  `~/Applications`, their `CFBundleIdentifier` (XML parsed directly, binary
+  plists through `plutil`), and the Library folders that go with them.
+  `com.apple.*` is never offered.
+- `src/cleanup/simulators.zig`, `xcode.zig`, `brew.zig`, `snapshots.zig` — the
+  tool-owned things, found by asking `simctl`, `xcodebuild`, `brew` and
+  `tmutil`, each with the removal its tool provides.
+- `src/cleanup/diskmap.zig` — the Space card's read-only rows: `df`'s figures
+  and the user's own folders. Items from here have `removal = .none` and no
+  tick, and `Tab.overview` exists only to group them (no sidebar tab shows it).
+- `src/cleanup/remove.zig` — the one place that decides how an item goes:
+  `trash` moves it, the tool removals run their command, `none` refuses.
+- `src/cleanup/exec.zig` — running a short command and reading its output,
+  blocking, for the worker thread only. It passes a real environment (brew
+  needs `$HOME`), merges stderr so error text can be read, and `jsonSlice`
+  trims the warnings around a tool's JSON.
+- `src/cleanup/trash.zig` — moves to `~/.Trash` on macOS or the freedesktop
+  trash on Linux with `rename(2)`, under a unique name. It never deletes for
+  good, and re-checks the protected prefixes and deny rules before each move.
+  `moveAppToTrash` is the one exception to the protected `/Applications`
+  prefix, and accepts only a real `.app` inside an Applications folder.
+- `src/app.zig` — `startCleanupScan` spawns the worker and publishes each
+  finished pass into a staging list under a spinlock; `pollCleanupScan` drains
+  it once per frame. The worker must never touch the window (Cocoa requires
+  the main thread). `cleanupSetTab` and `refreshCleanupView` decide what the
+  page shows: the current tab, then the safety filter, then the order.
+- `src/view_cleanup.zig`, plus `cleanupConfirm` in `src/view_sheet.zig` — the
+  page (sort, filter, ticking, footer) and the confirmation sheet, whose
+  wording follows the tab ("Uninstall 1 app?").
+- `src/view_side.zig` — the sidebar: the Cleanup section and its four tabs,
+  each showing what that tab found.
+
+Every walk is bounded: 20,000 files per folder (past that the size is a floor,
+drawn as `≈`), 12,000 folders and depth 6 for the project search, and 400
+project artifacts, 40,000 folders for large files, 400 apps, 80 simulators,
+120 casks, 120 formulae, 40 snapshots, and 12,000 files per folder for the
+disk map. Brew's retry rounds get a four-second budget.
+`docs/CLEANUP.md` has the full catalog and safety notes.
+
 ## Directory Structure
 
 - `src/` — All Zig source code (main entry point: `src/main.zig`)

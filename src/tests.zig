@@ -23,8 +23,13 @@ test {
     _ = @import("graff.zig");
     _ = @import("tests_select.zig");
     _ = @import("tests_menubar.zig");
+    _ = @import("tests_cleanup.zig");
     _ = @import("cleanup/safety.zig");
     _ = @import("cleanup/item.zig");
+    _ = @import("cleanup/measure.zig");
+    _ = @import("cleanup/exec.zig");
+    _ = @import("cleanup/large.zig");
+    _ = @import("cleanup/apps.zig");
     _ = @import("cleanup/scanner.zig");
     _ = @import("cleanup/trash.zig");
 }
@@ -37,6 +42,9 @@ pub fn fake(a: *App) !void {
     a.live = false;
     a.dark = false;
     a.uid = 501;
+    // The Cleanup page scans by itself the first time it opens; the tests
+    // stage their own items instead.
+    a.cleanup_auto = false;
     const s = &a.sampler;
     s.system = .{ .cores = 10, .cpu_user = 54, .cpu_system = 21, .mem_total = 16 << 30, .mem_app = 6 << 30, .mem_wired = 2 << 30, .mem_compressed = 1 << 30, .mem_cached = 4 << 30, .swap_used = 512 << 20, .pressure = 34, .reads = 1234567, .writes = 765432, .read_bytes = 300 << 30, .written_bytes = 500 << 30, .read_sec = 4 << 20, .written_sec = 1 << 20, .net_in = 90 << 30, .net_out = 20 << 30, .net_in_sec = 300 << 10, .net_out_sec = 40 << 10, .gpu = 59, .gpu_renderer = 52, .gpu_tiler = 18, .gpu_memory = 2 << 30, .load = .{ 12.5, 9.1, 6.0 }, .uptime_s = 27 * 86400 + 20 * 3600, .tasks = 4, .threads = 12288 };
     s.info = .{ .chip = "Apple M5", .model = "Mac17,1", .os = "macOS 27.0", .host = "Studio", .gpu = "Apple M5", .gpu_cores = 10, .fast = 4, .frugal = 6, .fast_name = "Super", .frugal_name = "Efficiency" };

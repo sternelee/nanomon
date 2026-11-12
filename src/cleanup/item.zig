@@ -5,12 +5,153 @@ const safety_mod = @import("safety.zig");
 const SafetyInfo = safety_mod.SafetyInfo;
 const SafetyLevel = safety_mod.SafetyLevel;
 
+/// The Cleanup sidebar's tabs: what each part of the page is for.
+pub const Tab = enum {
+    /// Not a tab of the sidebar: the read-only rows the disk map measures,
+    /// which the Overview page shows beside the machine's own tiles.
+    overview,
+    caches,
+    dev,
+    large,
+    uninstall,
+
+    pub fn title(self: Tab) []const u8 {
+        return switch (self) {
+            .overview => "Overview",
+            .caches => "App Caches",
+            .dev => "Dev Tools",
+            .large => "Large Files",
+            .uninstall => "App Uninstaller",
+        };
+    }
+
+    pub fn icon(self: Tab) []const u8 {
+        return switch (self) {
+            .overview => "chart.bar.xaxis",
+            .caches => "internaldrive",
+            .dev => "chevron.left.forwardslash.chevron.right",
+            .large => "doc",
+            .uninstall => "xmark.square",
+        };
+    }
+
+    /// What the tab is about, under the title.
+    pub fn subtitle(self: Tab) []const u8 {
+        return switch (self) {
+            .overview => "Where the space went, read-only",
+            .caches => "Caches, logs and the junk apps leave behind",
+            .dev => "Tool caches and the build folders inside projects",
+            .large => "The biggest files in your folders",
+            .uninstall => "An app, and everything it left in your Library",
+        };
+    }
+};
+
+/// How something is removed. Almost everything goes to the Trash; the few
+/// things only their own tool can take away go through that tool, and a
+/// read-only row is never removed at all.
+pub const Removal = enum {
+    /// Move to the Trash, where it can be put back.
+    trash,
+    /// `xcrun simctl runtime delete <target>`
+    simctl_runtime,
+    /// `xcrun simctl delete <target>`
+    simctl_device,
+    /// `xcodebuild -deleteComponent <target>`
+    xcode_component,
+    /// `brew uninstall <target>`
+    brew_formula,
+    /// `brew uninstall --cask <target>`
+    brew_cask,
+    /// `tmutil deletelocalsnapshots <target>`
+    tm_snapshot,
+    /// Read-only: nothing here removes this, it is only measured.
+    none,
+
+    /// Whether the page may offer to remove it.
+    pub fn removable(self: Removal) bool {
+        return self != .none;
+    }
+
+    /// Whether removing it goes through the Trash (and so can be undone).
+    pub fn trashed(self: Removal) bool {
+        return self == .trash;
+    }
+
+    /// The word the sheet and the footer use.
+    pub fn verb(self: Removal) []const u8 {
+        return switch (self) {
+            .trash => "Move to Trash",
+            .simctl_runtime, .simctl_device => "Delete",
+            .xcode_component => "Remove",
+            .brew_formula, .brew_cask => "Uninstall",
+            .tm_snapshot => "Delete",
+            .none => "Keep",
+        };
+    }
+};
+
+/// Where a scanned item came from: what the Cleanup page groups by.
+pub const Category = enum {
+    /// An app's own cache, under ~/Library/Caches or an app's Cache folder.
+    cache,
+    /// System junk: logs, crash reports, saved window state.
+    junk,
+    /// A tool's global cache, shared by every project (npm, Xcode, Homebrew).
+    dev,
+    /// A folder inside one project, rebuildable from that project.
+    project,
+    /// A large file of the user's own, in their folders.
+    large,
+    /// An installed app, with what it left in the Library.
+    app,
+    /// A simulator runtime or a simulator device.
+    simulator,
+    /// An Xcode component that can be downloaded again.
+    xcode,
+    /// A tool Homebrew installed.
+    brew,
+    /// Something read-only on the overview: a folder, or a whole category.
+    other,
+
+    pub fn title(self: Category) []const u8 {
+        return switch (self) {
+            .cache => "App Cache",
+            .junk => "System Junk",
+            .dev => "Dev Cache",
+            .project => "Project",
+            .large => "File",
+            .app => "App",
+            .simulator => "Simulator",
+            .xcode => "Xcode",
+            .brew => "Homebrew",
+            .other => "Folder",
+        };
+    }
+
+    /// Which tab of the Cleanup page this belongs to.
+    pub fn tab(self: Category) Tab {
+        return switch (self) {
+            .cache, .junk => .caches,
+            .dev, .project, .simulator, .xcode, .brew => .dev,
+            .large => .large,
+            .app => .uninstall,
+            .other => .overview,
+        };
+    }
+};
+
 /// A single location within a cache item (multiple locations can be merged)
 pub const CacheLocation = struct {
     path: []const u8,
     size_bytes: u64,
     last_modified: i64, // Unix timestamp
     folder_name: []const u8,
+    /// True when the size walk stopped at its limit: the size is a floor.
+    approx: bool = false,
+    /// True for an app bundle itself, which lives where apps live and so
+    /// needs the app rule when it is moved, not the strict one.
+    app_bundle: bool = false,
 };
 
 /// A cache item that can be cleaned.
@@ -27,6 +168,18 @@ pub const CacheItem = struct {
     selected: bool,
     /// Safety information
     safety_info: SafetyInfo,
+    /// Which part of the disk this came from.
+    category: Category = .cache,
+    /// How it is removed, and what that removal is aimed at (an identifier,
+    /// a component name, a snapshot date). `.trash` needs no target.
+    removal: Removal = .trash,
+    removal_target: ?[]const u8 = null,
+    /// False for something whose size cannot be measured (a Time Machine
+    /// snapshot): the page shows a dash rather than a made-up number.
+    measured: bool = true,
+    /// True when the size in the location is already right, so the scan need
+    /// not walk the folder again.
+    sized: bool = false,
 
     allocator: std.mem.Allocator,
 
@@ -54,6 +207,24 @@ pub const CacheItem = struct {
         return self.locations.items[0].path;
     }
 
+    /// Whether any location's size is a floor rather than the whole folder.
+    pub fn approx(self: *const CacheItem) bool {
+        for (self.locations.items) |loc| {
+            if (loc.approx) return true;
+        }
+        return false;
+    }
+
+    /// What the Kind column says: a cache folder is named by where it came
+    /// from, everything else by what it is ("Video", "Simulator runtime",
+    /// "Time Machine snapshot", "Application").
+    pub fn kind(self: *const CacheItem) []const u8 {
+        return switch (self.category) {
+            .cache => self.category.title(),
+            else => self.safety_info.headline,
+        };
+    }
+
     /// Format size as human-readable string
     pub fn formatSize(self: *const CacheItem, buffer: []u8) []const u8 {
         const size = self.sizeBytes();
@@ -62,26 +233,94 @@ pub const CacheItem = struct {
 
     /// Initialize a new cache item
     pub fn init(allocator: std.mem.Allocator, id: []const u8, app_name: []const u8, safety_info: SafetyInfo) !CacheItem {
+        const id_copy = try allocator.dupe(u8, id);
+        errdefer allocator.free(id_copy);
+        const name_copy = try allocator.dupe(u8, app_name);
+        errdefer allocator.free(name_copy);
+        // The safety words are the item's own: some callers build them (a
+        // Homebrew row names its cask), so the item frees them either way.
+        const headline = try allocator.dupe(u8, safety_info.headline);
+        errdefer allocator.free(headline);
+        const explanation = try allocator.dupe(u8, safety_info.explanation);
+        errdefer allocator.free(explanation);
+        const recovery = try allocator.dupe(u8, safety_info.recovery_steps);
+        errdefer allocator.free(recovery);
+        const reinstall = if (safety_info.reinstall_command) |command| try allocator.dupe(u8, command) else null;
         return .{
-            .id = try allocator.dupe(u8, id),
+            .id = id_copy,
             .definition_key = null,
             .locations = .empty,
-            .app_name = try allocator.dupe(u8, app_name),
+            .app_name = name_copy,
             .selected = false,
-            .safety_info = safety_info,
+            .safety_info = .{
+                .level = safety_info.level,
+                .headline = headline,
+                .explanation = explanation,
+                .recovery_steps = recovery,
+                .reinstall_command = reinstall,
+            },
             .allocator = allocator,
         };
     }
 
     /// Add a location to this item
     pub fn addLocation(self: *CacheItem, path: []const u8, size_bytes: u64, last_modified: i64, folder_name: []const u8) !void {
+        return self.addLocationSized(path, size_bytes, last_modified, folder_name, false);
+    }
+
+    /// Add a location, saying whether its size is exact.
+    pub fn addLocationSized(self: *CacheItem, path: []const u8, size_bytes: u64, last_modified: i64, folder_name: []const u8, is_floor: bool) !void {
+        const path_copy = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(path_copy);
+        const folder_copy = try self.allocator.dupe(u8, folder_name);
+        errdefer self.allocator.free(folder_copy);
         const loc = CacheLocation{
-            .path = try self.allocator.dupe(u8, path),
+            .path = path_copy,
             .size_bytes = size_bytes,
             .last_modified = last_modified,
-            .folder_name = try self.allocator.dupe(u8, folder_name),
+            .folder_name = folder_copy,
+            .approx = is_floor,
         };
         try self.locations.append(self.allocator, loc);
+    }
+
+    /// Say how this item is removed, and what the removal aims at.
+    pub fn setRemoval(self: *CacheItem, removal: Removal, target: ?[]const u8) !void {
+        if (self.removal_target) |old| self.allocator.free(old);
+        self.removal_target = if (target) |value| try self.allocator.dupe(u8, value) else null;
+        self.removal = removal;
+    }
+
+    /// What the page needs to build a row.
+    pub const Spec = struct {
+        id: []const u8,
+        name: []const u8,
+        info: SafetyInfo,
+        category: Category,
+        path: []const u8,
+        where: []const u8 = "",
+        size: u64 = 0,
+        /// True when `size` is already known, so the scan need not measure it.
+        sized: bool = false,
+        /// True when nothing can know the size (a Time Machine snapshot):
+        /// the page shows a dash instead.
+        unknown_size: bool = false,
+        removal: Removal = .trash,
+        target: ?[]const u8 = null,
+    };
+
+    /// Build an item with one location. The caller owns the result.
+    pub fn create(allocator: std.mem.Allocator, spec: Spec) !*CacheItem {
+        const item = try allocator.create(CacheItem);
+        errdefer allocator.destroy(item);
+        item.* = try CacheItem.init(allocator, spec.id, spec.name, spec.info);
+        errdefer item.deinit();
+        item.category = spec.category;
+        item.measured = !spec.unknown_size;
+        item.sized = spec.sized;
+        try item.addLocationSized(spec.path, spec.size, 0, spec.where, false);
+        try item.setRemoval(spec.removal, spec.target);
+        return item;
     }
 
     /// Deallocate resources
@@ -94,6 +333,13 @@ pub const CacheItem = struct {
         if (self.definition_key) |key| {
             self.allocator.free(key);
         }
+        if (self.removal_target) |target| {
+            self.allocator.free(target);
+        }
+        self.allocator.free(self.safety_info.headline);
+        self.allocator.free(self.safety_info.explanation);
+        self.allocator.free(self.safety_info.recovery_steps);
+        if (self.safety_info.reinstall_command) |command| self.allocator.free(command);
         self.allocator.free(self.id);
         self.allocator.free(self.app_name);
     }
