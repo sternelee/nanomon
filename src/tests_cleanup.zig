@@ -293,7 +293,7 @@ test "the app removes on a worker, and the page waits for it" {
     try std.testing.expect(a.cleanup_removing);
     // The page keeps drawing while the worker works: poll as the window does.
     var spins: usize = 0;
-    while (a.pollCleanupRemoval()) : (spins += 1) {
+    while (a.pollCleanupAction()) : (spins += 1) {
         if (spins > 200_000) return error.RemovalTimedOut;
         std.Thread.yield() catch {};
     }
@@ -340,8 +340,9 @@ test "the Overview page says where the space went, and removes nothing" {
     try std.testing.expect(t.containsText("Nothing here moves a file"));
     try t.screenshot("/tmp/nanomon-cleanup-overview.png");
 
-    // The Cleanup section lists its four tabs.
-    try std.testing.expect(t.hasText("App Caches") and t.hasText("App Uninstaller"));
+    // The Cleanup section lists its five tabs.
+    try std.testing.expect(t.hasText("App Caches") and t.hasText("Dev Tools"));
+    try std.testing.expect(t.hasText("CLI Tools") and t.hasText("App Uninstaller"));
 
     // Nothing here is tickable: a click on a folder row selects nothing.
     const documents = t.findText("Documents").?;
@@ -365,6 +366,36 @@ fn findItem(a: *App, name: []const u8) ?*CacheItem {
     return null;
 }
 
+/// Where the Scan button's arrow was drawn in the last frame, and at what
+/// angle.
+const Arrow = struct { box: ui.Rect, angle: f32 };
+
+fn arrow(t: *ui.Tester) ?Arrow {
+    for (t.ctx.nodes.items) |n| switch (n.content) {
+        .icon => |i| if (std.mem.eql(u8, i.name, "arrow.clockwise")) return .{ .box = n.rect, .angle = n.style.rotation },
+        else => {},
+    };
+    return null;
+}
+
+/// Whether two frames' pixels differ inside a box given in points (a frame's
+/// pixels are `scale` times that), taken a couple of points wider than the box
+/// so a turned symbol's corners are inside it too.
+fn boxDiffers(a: []const u8, b: []const u8, width: usize, box: ui.Rect, scale: f32) bool {
+    if (a.len != b.len or width == 0) return true;
+    const height = a.len / (width * 4);
+    const x0: usize = @intFromFloat(@max(0, (box.x - 2) * scale));
+    const y0: usize = @intFromFloat(@max(0, (box.y - 2) * scale));
+    const x1: usize = @intFromFloat(@min(@as(f32, @floatFromInt(width)), (box.x + box.w + 2) * scale));
+    const y1: usize = @intFromFloat(@min(@as(f32, @floatFromInt(height)), (box.y + box.h + 2) * scale));
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        const row = y * width * 4;
+        if (!std.mem.eql(u8, a[row + x0 * 4 .. row + x1 * 4], b[row + x0 * 4 .. row + x1 * 4])) return true;
+    }
+    return false;
+}
+
 /// An item of any kind, for the tests that are about the page rather than
 /// the scan.
 const Spec = struct {
@@ -376,6 +407,10 @@ const Spec = struct {
     removal: item_mod.Removal = .trash,
     target: ?[]const u8 = null,
     headline: []const u8 = "Thing",
+    /// How a command-line tool is updated, and the versions either side.
+    update: ?item_mod.Update = null,
+    version: ?[]const u8 = null,
+    latest: ?[]const u8 = null,
     /// True when nothing can know the size (a Time Machine snapshot).
     unknown_size: bool = false,
 };
@@ -393,6 +428,9 @@ fn addSpec(a: *App, spec: Spec) !void {
         .unknown_size = spec.unknown_size,
         .removal = spec.removal,
         .target = spec.target,
+        .update = spec.update,
+        .installed_version = spec.version,
+        .latest_version = spec.latest,
     });
     try a.cleanup_items.append(a.sampler.gpa, item);
 }
@@ -410,7 +448,7 @@ test "the sidebar's Cleanup tabs switch what the page shows" {
     defer t.deinit();
     t.settle(2);
 
-    // All four tabs are in the sidebar, under their own heading, before System.
+    // All five tabs are in the sidebar, under their own heading, before System.
     try std.testing.expect(t.hasText("Cleanup"));
     try std.testing.expect(t_mod.below(&t, "Cleanup", "App Caches"));
     try std.testing.expect(t_mod.below(&t, "App Uninstaller", "System"));
@@ -455,7 +493,7 @@ test "each kind of item says how it goes, and warns when it is for good" {
     // A simulator, a Homebrew tool and a snapshot: none of them goes to the
     // Trash, so the page says so before anything happens.
     try addSpec(&a, .{ .name = "iPhone 17 (iOS 26.5)", .where = "CoreSimulator", .path = "/tmp/nanomon-test/device", .size = 2 << 30, .category = .simulator, .removal = .simctl_device, .target = "UDID-1", .headline = "Simulator" });
-    try addSpec(&a, .{ .name = "jq", .where = "Cellar", .path = "/tmp/nanomon-test/jq", .size = 1 << 20, .category = .brew, .removal = .brew_formula, .target = "jq", .headline = "Homebrew tool" });
+    try addSpec(&a, .{ .name = "jq", .where = "Homebrew", .path = "/tmp/nanomon-test/jq", .size = 1 << 20, .category = .cli, .removal = .brew_formula, .target = "jq", .headline = "Homebrew tool" });
     try addSpec(&a, .{ .name = "Snapshot 2026-11-12-120000", .where = "Time Machine", .path = "/2026-11-12-120000", .size = 0, .category = .junk, .removal = .tm_snapshot, .target = "2026-11-12-120000", .headline = "Time Machine snapshot", .unknown_size = true });
     a.refreshCleanupView();
     a.cleanupSetTab(.dev);
@@ -466,10 +504,15 @@ test "each kind of item says how it goes, and warns when it is for good" {
     defer t.deinit();
     t.settle(1);
 
-    // Dev Tools: the simulator and the Homebrew tool, each named for what it
-    // is, with the simulator's size.
-    try std.testing.expect(t.hasText("Simulator") and t.hasText("Homebrew tool"));
+    // Dev Tools: the simulator, named for what it is, with its size.
+    try std.testing.expect(t.hasText("Simulator"));
     try std.testing.expect(t.containsText("2.0 GB"));
+
+    // CLI Tools: the Homebrew tool, which is not Dev Tools' business any
+    // more, with the manager that owns it.
+    try t_mod.open(&t, "CLI Tools");
+    try std.testing.expect(t.hasText("Homebrew tool") and t.hasText("Homebrew"));
+    try t_mod.open(&t, "Dev Tools");
 
     // App Caches: the snapshot, whose size tmutil does not report, so it
     // reads as a dash rather than a made-up number.
@@ -543,4 +586,195 @@ test "ticked items move to the Trash, and the ones that cannot stay" {
     const in_trash = try std.fs.path.join(gpa, &.{ trash.files, "com.google.Chrome" });
     defer gpa.free(in_trash);
     _ = try std.Io.Dir.cwd().statFile(io, in_trash, .{});
+}
+
+test "the CLI Tools tab names the version, and offers an update for what is behind" {
+    const gpa = std.testing.allocator;
+    var a: App = .init(gpa, std.testing.io);
+    defer a.deinit();
+    try t_mod.fake(&a);
+    // Two tools from two managers — one behind, one with nothing newer — and
+    // a program nobody manages.
+    try addSpec(&a, .{ .name = "wrangler", .path = "/tmp/nanomon-test/npm/wrangler", .size = 40 << 20, .category = .cli, .where = "npm -g", .headline = "npm tool", .removal = .npm_global, .target = "wrangler", .update = .npm_latest, .version = "4.100.0", .latest = "4.114.0" });
+    try addSpec(&a, .{ .name = "bat", .path = "/tmp/nanomon-test/cargo/bat", .size = 6 << 20, .category = .cli, .where = "cargo", .headline = "cargo tool", .removal = .cargo_install, .target = "bat", .update = .cargo_install, .version = "0.18.3" });
+    try addSpec(&a, .{ .name = "mytool", .path = "/tmp/nanomon-test/bin/mytool", .size = 2 << 20, .category = .cli, .where = "~/.local/bin", .headline = "Downloaded tool", .removal = .trash });
+    a.cleanupSetTab(.cli);
+    a.page = .cleanup;
+
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&a, view.view), .{ .width = 1200, .height = 760, .theme = theme.ui(false) });
+    defer t.deinit();
+    t.settle(2);
+
+    // The Version column: what is installed, and what its manager offers.
+    try std.testing.expect(t.hasText("4.100.0") and t.hasText("4.114.0"));
+    try std.testing.expect(t.hasText("0.18.3"));
+    // The kind, and the manager that owns each one.
+    try std.testing.expect(t.hasText("npm tool") and t.hasText("npm -g"));
+    try std.testing.expect(t.hasText("Downloaded tool") and t.hasText("~/.local/bin"));
+    try std.testing.expect(t.containsText("3 found"));
+
+    // Ticking the tool that is behind offers an update beside its uninstall.
+    const wrangler = t.findText("wrangler").?;
+    t.click(wrangler.x + 10, wrangler.y + wrangler.h / 2);
+    t.settle(1);
+    try std.testing.expect(t.hasText("1 ticked"));
+    try std.testing.expect(t.hasText("Update 1…") and t.hasText("Uninstall…"));
+    try t.screenshot("/tmp/nanomon-cleanup-cli.png");
+
+    // The sheet says what an update is, and that nothing is removed.
+    try t_mod.open(&t, "Update 1…");
+    try std.testing.expect(t.hasText("Update 1 tool?"));
+    try std.testing.expect(t.containsText("4.100.0 → 4.114.0"));
+    try std.testing.expect(t.containsText("Nothing is removed"));
+    try t.screenshot("/tmp/nanomon-cleanup-cli-update.png");
+    try t_mod.open(&t, "Cancel");
+
+    // A downloaded program has nothing to update it with: only the removal is
+    // offered, and the sheet calls it a tool.
+    t.click(wrangler.x + 10, wrangler.y + wrangler.h / 2);
+    t.settle(1);
+    const tool = t.findText("mytool").?;
+    t.click(tool.x + 10, tool.y + tool.h / 2);
+    t.settle(1);
+    try std.testing.expect(t.hasText("Move to Trash…") and !t.containsText("Update "));
+    try t_mod.open(&t, "Move to Trash…");
+    try std.testing.expect(t.hasText("Move 1 tool to the Trash?"));
+    try t_mod.open(&t, "Cancel");
+}
+
+test "an update that cannot run leaves the tool where it was" {
+    const gpa = std.testing.allocator;
+    var a: App = .init(gpa, std.testing.io);
+    defer a.deinit();
+    try t_mod.fake(&a);
+    // A tool behind a newer version, with nothing for the command to aim at:
+    // no command is built, so nothing runs — and the row must still say it is
+    // behind, rather than pretend it was updated.
+    try addSpec(&a, .{ .name = "wrangler", .path = "/tmp/nanomon-test/npm/wrangler", .size = 40 << 20, .category = .cli, .where = "npm -g", .headline = "npm tool", .removal = .npm_global, .update = .npm_latest, .version = "4.100.0", .latest = "4.114.0" });
+    a.cleanupSetTab(.cli);
+    const item = findItem(&a, "wrangler").?;
+    a.cleanupToggle(item);
+    a.cleanupUpdateNow();
+
+    try std.testing.expect(a.cleanup_notice_error);
+    try std.testing.expectEqualStrings("1 tool could not be updated.", a.cleanup_notice.?);
+    // Still there, still behind, and still ticked.
+    try std.testing.expect(item.outdated());
+    try std.testing.expectEqualStrings("4.100.0", item.installed_version.?);
+    try std.testing.expectEqual(@as(usize, 1), a.cleanup_items.items.len);
+    try std.testing.expect(a.cleanupIsSelected(item));
+}
+
+test "a tool that was updated is not offered another update" {
+    const gpa = std.testing.allocator;
+    var a: App = .init(gpa, std.testing.io);
+    defer a.deinit();
+    try t_mod.fake(&a);
+    // Cargo has no local answer for whether a crate is behind, so its row
+    // offers a rebuild at the newest version; once that has been done, the
+    // offer goes away until the next scan asks again.
+    try addSpec(&a, .{ .name = "bat", .path = "/tmp/nanomon-test/cargo/bat", .size = 6 << 20, .category = .cli, .where = "cargo", .headline = "cargo tool", .removal = .cargo_install, .target = "bat", .update = .cargo_install, .version = "0.18.3" });
+    const item = findItem(&a, "bat").?;
+    a.cleanupToggle(item);
+    try std.testing.expectEqual(@as(usize, 1), a.cleanupSelectionUpdates());
+
+    a.cleanup_action_items.clearRetainingCapacity();
+    a.cleanup_action_ok.clearRetainingCapacity();
+    a.cleanup_action_items.append(gpa, item) catch return error.OutOfMemory;
+    a.cleanup_action_ok.append(gpa, true) catch return error.OutOfMemory;
+    a.applyUpdates(.{ .updated = 1, .failed = 0 });
+
+    try std.testing.expectEqual(@as(usize, 0), a.cleanupSelectionUpdates());
+    try std.testing.expect(!item.outdated());
+    try std.testing.expectEqualStrings("0.18.3", item.installed_version.?);
+    try std.testing.expectEqualStrings("bat", item.removal_target.?);
+}
+
+test "the CLI Tools list sorts by kind, where and size" {
+    const gpa = std.testing.allocator;
+    var a: App = .init(gpa, std.testing.io);
+    defer a.deinit();
+    try t_mod.fake(&a);
+    // Three managers, so every column has something to order by.
+    try addSpec(&a, .{ .name = "wrangler", .path = "/tmp/nanomon-test/npm/wrangler", .size = 40 << 20, .category = .cli, .where = "npm -g", .headline = "npm tool" });
+    try addSpec(&a, .{ .name = "jq", .path = "/tmp/nanomon-test/brew/jq", .size = 1 << 20, .category = .cli, .where = "Homebrew", .headline = "Homebrew tool" });
+    try addSpec(&a, .{ .name = "bat", .path = "/tmp/nanomon-test/cargo/bat", .size = 6 << 20, .category = .cli, .where = "cargo", .headline = "cargo tool" });
+    a.cleanupSetTab(.cli);
+    a.page = .cleanup;
+
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&a, view.view), .{ .width = 1200, .height = 760, .theme = theme.ui(false) });
+    defer t.deinit();
+    t.settle(2);
+
+    // The page opens biggest first.
+    try std.testing.expect(t_mod.below(&t, "wrangler", "bat"));
+    try std.testing.expect(t_mod.below(&t, "bat", "jq"));
+
+    // By where: the manager that owns each one, A to Z.
+    try t_mod.open(&t, "Where");
+    try std.testing.expect(t_mod.below(&t, "jq", "bat"));
+    try std.testing.expect(t_mod.below(&t, "bat", "wrangler"));
+    try t.screenshot("/tmp/nanomon-cleanup-cli-sort.png");
+
+    // By kind: what each tool is.
+    try t_mod.open(&t, "Kind");
+    try std.testing.expect(t_mod.below(&t, "jq", "bat"));
+    try std.testing.expect(t_mod.below(&t, "bat", "wrangler"));
+
+    // By size again, the biggest on top.
+    try t_mod.open(&t, "Size");
+    try std.testing.expect(t_mod.below(&t, "wrangler", "jq"));
+}
+
+test "the scan's arrow turns while the scan runs" {
+    const gpa = std.testing.allocator;
+    var a: App = .init(gpa, std.testing.io);
+    defer a.deinit();
+    try t_mod.fake(&a);
+    try stage(&a);
+    a.page = .cleanup;
+    // A scan in flight, with no worker behind it: what the page draws.
+    a.cleanup_scanning = true;
+
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&a, view.view), .{ .width = 1100, .height = 760, .theme = theme.ui(false) });
+    defer t.deinit();
+    t.settle(2);
+
+    // The button says what it is doing, and its arrow is at an angle.
+    try std.testing.expect(t.hasText("Scanning…"));
+    const first = arrow(&t) orelse return error.NoArrow;
+    t.advance(0.1);
+    const turning = arrow(&t) orelse return error.NoArrow;
+    // One turn a second, read off the frame clock.
+    const expected: f32 = @floatCast(@mod(t.time - @as(f64, t.dt), 1.0) * std.math.tau);
+    try std.testing.expect(turning.angle != first.angle);
+    try std.testing.expectApproxEqAbs(expected, turning.angle, 0.001);
+    // The next frame is a sixtieth away: the arrow has moved by then.
+    try std.testing.expect((t.ctx.frame_in orelse 1) <= 1.0 / 60.0 + 1e-6);
+    try t.screenshot("/tmp/nanomon-cleanup-scanning.png");
+
+    // And it is drawn turned: half a turn later the pixels in its box have
+    // moved, so the angle reaches the picture, not just the tree.
+    const before = try t.render(gpa);
+    defer before.deinit(gpa);
+    t.advance(0.5);
+    const after = try t.render(gpa);
+    defer after.deinit(gpa);
+    try std.testing.expect(boxDiffers(before.bytes, after.bytes, before.width, turning.box, t.scale));
+
+    // The button drawn in its place is the real one's shape: the arrow sits on
+    // the same centre line, the same gap from the words, once the scan is over
+    // and `ui.button` draws it again.
+    const centre = turning.box.y + turning.box.h / 2;
+    const gap = (t.findText("Scanning…") orelse return error.NoLabel).x - (turning.box.x + turning.box.w);
+    a.cleanup_scanning = false;
+    t.settle(2);
+    const still = arrow(&t) orelse return error.NoArrow;
+    const label = t.findText("Scan") orelse return error.NoLabel;
+    try std.testing.expectEqual(@as(f32, 0), still.angle);
+    try std.testing.expectApproxEqAbs(centre, still.box.y + still.box.h / 2, 0.5);
+    try std.testing.expectApproxEqAbs(gap, label.x - (still.box.x + still.box.w), 0.5);
 }

@@ -69,7 +69,7 @@ pub fn view(a: *App, c: *ui.Context) void {
     // slow enough not to spin between passes.
     if (a.pollCleanupScan()) c.frameIn(1.0 / 20.0);
     // A removal is like a scan: the page waits on the worker.
-    if (a.pollCleanupRemoval()) c.frameIn(1.0 / 20.0);
+    if (a.pollCleanupAction()) c.frameIn(1.0 / 20.0);
 }
 
 /// The page under the header, scrolling: cards with room between.
@@ -103,6 +103,6 @@ fn keys(c: *ui.Context, a: *App) void {
     if (c.shortcut(.{ .key = 'p', .cmd = true, .shift = true })) a.paused = !a.paused;
     if (a.page == .cleanup and c.shortcut(.{ .key = 'r', .cmd = true })) a.startCleanupScan();
     if (c.shortcut(.{ .key = S.escape })) {
-        if (a.suggest_at != null) c.focus = 0 else if (a.cleanup_confirm) a.cleanup_confirm = false else if (a.confirm_marked) a.confirm_marked = false else if (a.graff.open) a.graff.open = false else if (a.confirm != null) a.confirm = null else if (a.inspect != null) a.inspect = null else if (a.menu) a.menu = false else a.selected = null;
+        if (a.suggest_at != null) c.focus = 0 else if (a.cleanup_confirm != .none) a.cleanup_confirm = .none else if (a.confirm_marked) a.confirm_marked = false else if (a.graff.open) a.graff.open = false else if (a.confirm != null) a.confirm = null else if (a.inspect != null) a.inspect = null else if (a.menu) a.menu = false else a.selected = null;
     }
 }

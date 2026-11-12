@@ -38,7 +38,7 @@ pub fn sidebar(c: *ui.Context, a: *App, k: theme.Colors) void {
     item(c, a, k, .{ .page = .network, .icon = "network", .name = "Network" }, k.teal, c.print("{s}", .{model.rate(&b, sy.net_in_sec + sy.net_out_sec)}));
     // Cleanup, with its parts under it, before the machine's own pages.
     section(c, k, "Cleanup");
-    const tabs = [_]app_mod.CleanupTab{ .caches, .dev, .large, .uninstall };
+    const tabs = [_]app_mod.CleanupTab{ .caches, .dev, .cli, .large, .uninstall };
     for (tabs) |tab| {
         const totals = a.cleanupTabTotals(tab);
         // A tab whose items have no size to report (a snapshot) shows how

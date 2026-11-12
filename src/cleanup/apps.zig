@@ -14,6 +14,10 @@ pub const Options = struct {
     /// Where the apps live. The tests point this at a folder of their own.
     roots: []const []const u8 = &.{"/Applications"},
     max_items: usize = 400,
+    /// Where each app's row goes the moment it is made, so the page fills in
+    /// while the scan carries on. The scanner measures it and hands it on;
+    /// null keeps it here, for the pass to return.
+    batch: ?item_mod.Batch = null,
 };
 
 pub fn scan(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.ArrayListUnmanaged(*CacheItem) {
@@ -25,14 +29,16 @@ pub fn scan(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.ArrayL
         }
         items.deinit(allocator);
     }
+    var found: usize = 0;
     for (opts.roots) |root| {
-        if (items.items.len >= opts.max_items) break;
-        try scanRoot(allocator, io, opts, &items, root);
+        if (found >= opts.max_items) break;
+        found += try scanRoot(allocator, io, opts, &items, root, opts.max_items - found);
     }
     return items;
 }
 
-fn scanRoot(allocator: std.mem.Allocator, io: std.Io, opts: Options, items: *std.ArrayListUnmanaged(*CacheItem), root: []const u8) !void {
+/// One Applications folder, up to `budget` apps; how many it added.
+fn scanRoot(allocator: std.mem.Allocator, io: std.Io, opts: Options, items: *std.ArrayListUnmanaged(*CacheItem), root: []const u8, budget: usize) !usize {
     // "/Applications" stands on its own; the tests' roots are under their home.
     const full_root = if (std.fs.path.isAbsolute(root))
         try allocator.dupe(u8, root)
@@ -40,12 +46,13 @@ fn scanRoot(allocator: std.mem.Allocator, io: std.Io, opts: Options, items: *std
         try std.fs.path.join(allocator, &.{ opts.home, root });
     defer allocator.free(full_root);
 
-    var dir = std.Io.Dir.cwd().openDir(io, full_root, .{ .iterate = true }) catch return;
+    var dir = std.Io.Dir.cwd().openDir(io, full_root, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
 
+    var found: usize = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        if (items.items.len >= opts.max_items) return;
+        if (found >= budget) return found;
         if (entry.kind != .directory) continue;
         if (!std.mem.endsWith(u8, entry.name, ".app")) continue;
         if (safety.isProtectedPath(entry.name)) continue;
@@ -61,7 +68,12 @@ fn scanRoot(allocator: std.mem.Allocator, io: std.Io, opts: Options, items: *std
         if (id) |value| if (isAppleID(value)) continue;
 
         try addApp(allocator, io, opts, items, bundle, name, id);
+        found += 1;
+        // The row is complete: it can be measured and shown without waiting
+        // for the rest of Applications.
+        if (opts.batch) |b| b.give(b.ctx, .app, items);
     }
+    return found;
 }
 
 fn addApp(allocator: std.mem.Allocator, io: std.Io, opts: Options, items: *std.ArrayListUnmanaged(*CacheItem), bundle: []const u8, name: []const u8, id: ?[]const u8) !void {

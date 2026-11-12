@@ -231,16 +231,19 @@ pub fn confirm(c: *ui.Context, a: *App, k: theme.Colors) void {
 /// The Cleanup page's sheet: the items about to move to the Trash, what they
 /// give back, and the promise that they can be put back.
 pub fn cleanupConfirm(c: *ui.Context, a: *App, k: theme.Colors) void {
-    if (!a.cleanup_confirm) return;
-    const count = a.cleanup_selected.count();
+    if (a.cleanup_confirm == .none) return;
+    // An update takes only the tools a manager can bring up to date; a
+    // removal takes everything ticked.
+    const updating = a.cleanup_confirm == .update;
+    const count = if (updating) a.cleanupSelectionUpdates() else a.cleanup_selected.count();
     if (count == 0) {
-        a.cleanup_confirm = false;
+        a.cleanup_confirm = .none;
         return;
     }
-    const verb = a.cleanupSelectionVerb();
+    const verb = if (updating) "Update" else a.cleanupSelectionVerb();
     const s = scrim(c, 0.18);
     defer s.end();
-    if (s.clicked()) a.cleanup_confirm = false;
+    if (s.clicked()) a.cleanup_confirm = .none;
     const gap = ui.div(c).row().h(kit.header_h + 20);
     gap.end();
     const box = ui.div(c).column().w(460).gap(12).p(20).rounded(12).bg(k.page).border(k.border).shadowLg();
@@ -249,9 +252,11 @@ pub fn cleanupConfirm(c: *ui.Context, a: *App, k: theme.Colors) void {
     {
         const t = ui.div(c).row().gap(10).itemsCenter();
         defer t.end();
-        kit.chip(c, "trash", k.orange, 28, false);
+        kit.chip(c, if (updating) "arrow.down.circle" else "trash", if (updating) k.blue else k.orange, 28, false);
         const noun = if (a.cleanup_tab == .uninstall)
             (if (count == 1) "app" else "apps")
+        else if (a.cleanup_tab == .cli)
+            (if (count == 1) "tool" else "tools")
         else
             (if (count == 1) "item" else "items");
         const title = if (std.mem.eql(u8, verb, "Move to Trash"))
@@ -266,9 +271,11 @@ pub fn cleanupConfirm(c: *ui.Context, a: *App, k: theme.Colors) void {
         var shown: usize = 0;
         var it = a.cleanup_selected.iterator();
         while (it.next()) |entry| {
+            const item = entry.key_ptr.*;
+            // A tool with nothing newer is not part of an update.
+            if (updating and item.update == null) continue;
             if (shown == 7) break;
             shown += 1;
-            const item = entry.key_ptr.*;
             ui.key(c, item.primaryPath());
             const r = ui.div(c).row().wFull().gap(8).itemsCenter().h(20);
             defer r.end();
@@ -276,8 +283,13 @@ pub fn cleanupConfirm(c: *ui.Context, a: *App, k: theme.Colors) void {
             ui.text(c, item.app_name, .{ .size = 12, .color = k.text });
             if (item.locations.items.len > 1) ui.text(c, c.print("+{d} files", .{item.locations.items.len - 1}), .{ .size = 11, .color = k.tertiary });
             ui.spacer(c);
-            var buf: [32]u8 = undefined;
-            ui.text(c, c.print("{s}{s}", .{ if (item.approx()) "≈ " else "", item.formatSize(&buf) }), .{ .size = 11, .mono = true, .color = k.secondary });
+            if (updating) {
+                const installed = item.installed_version orelse "—";
+                ui.text(c, c.print("{s} → {s}", .{ installed, item.latest_version orelse "newest" }), .{ .size = 11, .mono = true, .color = k.orange });
+            } else {
+                var buf: [32]u8 = undefined;
+                ui.text(c, c.print("{s}{s}", .{ if (item.approx()) "≈ " else "", item.formatSize(&buf) }), .{ .size = 11, .mono = true, .color = k.secondary });
+            }
         }
         if (count > shown) ui.text(c, c.print("and {d} more", .{count - shown}), .{ .size = 11.5, .color = k.secondary });
     }
@@ -290,10 +302,14 @@ pub fn cleanupConfirm(c: *ui.Context, a: *App, k: theme.Colors) void {
             break;
         }
     }
-    const note = if (!a.cleanupSelectionUndoable())
+    const note = if (updating)
+        // An update replaces what is there: nothing is removed, so nothing
+        // has to be put back.
+        "Each tool is updated by the manager that installed it — brew upgrade, npm, pnpm, bun, pipx or cargo — and the newest version it offers is installed. Nothing is removed."
+    else if (!a.cleanupSelectionUndoable())
         // Not everything here can be put back: the tool that owns it removes
         // it for good, and the sheet says so before anything happens.
-        c.print("{s}{s} is freed. Some of this is removed for good by its own tool — a simulator, Homebrew, Time Machine or Xcode — and does not go to the Trash.", .{ if (any_approx) "≈ " else "", item_mod.formatBytes(a.cleanupSelectedBytes(), &buf) })
+        c.print("{s}{s} is freed. Some of this is removed for good by its own tool — Homebrew, npm, pnpm, bun, pipx, cargo, a simulator, Time Machine or Xcode — and does not go to the Trash.", .{ if (any_approx) "≈ " else "", item_mod.formatBytes(a.cleanupSelectedBytes(), &buf) })
     else if (a.cleanup_tab == .uninstall)
         c.print("{s}{s} is freed, including what the app left in your Library. Everything moves to the Trash, so the app can be put back until you empty it.", .{ if (any_approx) "≈ " else "", item_mod.formatBytes(a.cleanupSelectedBytes(), &buf) })
     else
@@ -303,8 +319,10 @@ pub fn cleanupConfirm(c: *ui.Context, a: *App, k: theme.Colors) void {
         const r = ui.div(c).row().wFull().gap(8).pt(4);
         defer r.end();
         ui.spacer(c);
-        if (ui.button(c, "Cancel", .{ .variant = .secondary, .size = 12.5 }).clicked) a.cleanup_confirm = false;
+        if (ui.button(c, "Cancel", .{ .variant = .secondary, .size = 12.5 }).clicked) a.cleanup_confirm = .none;
         const action = verb;
-        if (ui.button(c, action, .{ .variant = .primary, .size = 12.5 }).clicked) a.cleanupDeleteSelected();
+        if (ui.button(c, action, .{ .variant = .primary, .size = 12.5 }).clicked) {
+            if (updating) a.cleanupUpdateSelected() else a.cleanupDeleteSelected();
+        }
     }
 }

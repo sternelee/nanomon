@@ -24,8 +24,17 @@ pub const RemovalReport = struct {
     freed: u64 = 0,
 };
 
-/// The Cleanup sidebar's tabs (App Caches, Dev Tools, Large Files, App
-/// Uninstaller), as the item model names them.
+/// What an update run did, for the notice the page shows afterwards.
+pub const UpdateReport = struct {
+    updated: usize = 0,
+    failed: usize = 0,
+};
+
+/// Which confirmation sheet the Cleanup page has up.
+pub const CleanupConfirm = enum { none, remove, update };
+
+/// The Cleanup sidebar's tabs (App Caches, Dev Tools, CLI Tools, Large Files,
+/// App Uninstaller), as the item model names them.
 pub const CleanupTab = item_mod.Tab;
 
 /// How many passes one Cleanup scan runs, for the "N of 13" the page shows.
@@ -41,6 +50,8 @@ pub const TabTotals = struct { count: usize, bytes: u64 };
 pub const CleanupSort = enum {
     size,
     name,
+    kind,
+    where,
     safety,
 };
 
@@ -75,6 +86,10 @@ fn cleanupScanWorker(a: *App) void {
     };
     defer scanner.deinit();
     scanner.cancel = &a.cleanup_stop;
+    // Each row is staged the moment a pass has it: the page shows it on its
+    // next frame, rather than waiting for the pass — or the scan — to end.
+    scanner.sink = &stageCleanupItem;
+    scanner.sink_ctx = a;
     var volume: Volume = .{ .total = 0, .used = 0, .free = 0 };
     scanner.volume = &volume;
 
@@ -92,7 +107,7 @@ fn cleanupScanWorker(a: *App) void {
         .{ .f = CacheScanner.scanSimulators },
         .{ .f = CacheScanner.scanXcodeComponents },
         .{ .f = CacheScanner.scanBrewCasks },
-        .{ .f = CacheScanner.scanBrewFormulae },
+        .{ .f = CacheScanner.scanCliTools },
         .{ .f = CacheScanner.scanSnapshots },
         .{ .f = CacheScanner.scanDiskMap },
     };
@@ -118,9 +133,22 @@ fn cleanupScanWorker(a: *App) void {
 /// Hand a finished pass to the main thread without touching the UI here.
 fn publishCleanupResult(a: *App, list: *std.ArrayListUnmanaged(*CacheItem)) void {
     defer list.deinit(a.sampler.gpa);
+    stageCleanupItems(a, list.items);
+}
+
+/// One row, the moment a pass has it: the scanner's sink, called on the
+/// worker thread.
+fn stageCleanupItem(ctx: *anyopaque, item: *CacheItem) void {
+    const a: *App = @ptrCast(@alignCast(ctx));
+    stageCleanupItems(a, &.{item});
+}
+
+/// Put rows where the next frame will find them. The handover is a small list
+/// guarded by a spinlock, and nothing here touches the window.
+fn stageCleanupItems(a: *App, items: []const *CacheItem) void {
     a.lockCleanup();
     defer a.unlockCleanup();
-    for (list.items) |item| {
+    for (items) |item| {
         a.cleanup_staging.append(a.sampler.gpa, item) catch {
             item.deinit();
             a.sampler.gpa.destroy(item);
@@ -128,22 +156,28 @@ fn publishCleanupResult(a: *App, list: *std.ArrayListUnmanaged(*CacheItem)) void
     }
 }
 
-/// Removes what the page ticked, off the UI thread. It touches the filesystem
-/// and the flags it was handed, and nothing of the window.
-fn cleanupRemoveWorker(a: *App) void {
+/// Removes or updates what the page ticked, off the UI thread. It touches the
+/// filesystem and the flags it was handed, and nothing of the window.
+fn cleanupActionWorker(a: *App) void {
     var io_impl: std.Io.Threaded = std.Io.Threaded.init_single_threaded;
     const io = io_impl.io();
 
-    var report: RemovalReport = .{ .failed = a.cleanup_removal_items.items.len };
-    if (a.cleanupTrash(io)) |trash| {
-        var owned = trash;
-        defer owned.deinit();
-        report = a.performRemovals(&owned);
-    } else |_| {}
-
-    a.lockCleanup();
-    a.cleanup_removal_staged = report;
-    a.unlockCleanup();
+    if (a.cleanup_updating) {
+        const report = a.performUpdates();
+        a.lockCleanup();
+        a.cleanup_update_staged = report;
+        a.unlockCleanup();
+    } else {
+        var report: RemovalReport = .{ .failed = a.cleanup_action_items.items.len };
+        if (a.cleanupTrash(io)) |trash| {
+            var owned = trash;
+            defer owned.deinit();
+            report = a.performRemovals(&owned);
+        } else |_| {}
+        a.lockCleanup();
+        a.cleanup_removal_staged = report;
+        a.unlockCleanup();
+    }
     a.cleanup_removal_done.store(true, .release);
 }
 
@@ -315,15 +349,20 @@ pub const App = struct {
     /// The disk's figures, handed over with the results for the overview.
     cleanup_volume_staged: ?Volume = null,
     cleanup_volume: ?Volume = null,
-    /// Cleanup: a removal is running on a background thread (brew uninstall
-    /// and simctl delete take seconds; the window must keep drawing).
+    /// Cleanup: a removal or an update is running on a background thread
+    /// (brew uninstall and simctl delete take seconds; the window must keep
+    /// drawing).
     cleanup_removing: bool = false,
+    /// Which of the two it is: the footer's word, and what the worker does.
+    cleanup_updating: bool = false,
     cleanup_removal_thread: ?std.Thread = null,
-    /// The items being removed, and which of them went: the worker fills the
-    /// second, the main thread reads it after joining.
-    cleanup_removal_items: std.ArrayListUnmanaged(*CacheItem) = .empty,
-    cleanup_removal_ok: std.ArrayListUnmanaged(bool) = .empty,
+    /// The items the running action is working on (removing, or updating),
+    /// and which of them went through: the worker fills the second, the main
+    /// thread reads it after joining.
+    cleanup_action_items: std.ArrayListUnmanaged(*CacheItem) = .empty,
+    cleanup_action_ok: std.ArrayListUnmanaged(bool) = .empty,
     cleanup_removal_staged: ?RemovalReport = null,
+    cleanup_update_staged: ?UpdateReport = null,
     cleanup_removal_done: std.atomic.Value(bool) = .init(false),
     /// Set when the app is going away, so a long scan stops promptly.
     cleanup_stop: std.atomic.Value(bool) = .init(false),
@@ -357,8 +396,8 @@ pub const App = struct {
     cleanup_filter: CleanupFilter = .all,
     /// Cleanup: which tab of the page shows.
     cleanup_tab: CleanupTab = .caches,
-    /// Cleanup: confirm deletion
-    cleanup_confirm: bool = false,
+    /// Cleanup: which confirmation sheet is up, if any.
+    cleanup_confirm: CleanupConfirm = .none,
     /// Cleanup: what just happened (moved to the Trash, or why not).
     cleanup_notice: ?[]const u8 = null,
     cleanup_notice_error: bool = false,
@@ -395,7 +434,7 @@ pub const App = struct {
         }
         a.cleanup_staging.clearRetainingCapacity();
         a.unlockCleanup();
-        a.cleanup_confirm = false;
+        a.cleanup_confirm = .none;
         a.clearCleanupNotice();
         a.cleanup_scanned = true;
         a.cleanup_scan_failed.store(false, .release);
@@ -497,6 +536,8 @@ pub const App = struct {
         const rank = switch (a.cleanup_sort) {
             .size => std.math.order(lhs.sizeBytes(), rhs.sizeBytes()),
             .name => std.mem.order(u8, lhs.app_name, rhs.app_name),
+            .kind => std.mem.order(u8, lhs.kind(), rhs.kind()),
+            .where => std.mem.order(u8, lhs.where(), rhs.where()),
             .safety => std.math.order(lhs.safety_info.level.sortOrder(), rhs.safety_info.level.sortOrder()),
         };
         if (rank != .eq) {
@@ -591,6 +632,17 @@ pub const App = struct {
         return true;
     }
 
+    /// How many of the ticked items a manager can bring up to date. The
+    /// footer offers an update when there is at least one.
+    pub fn cleanupSelectionUpdates(a: *App) usize {
+        var count: usize = 0;
+        var it = a.cleanup_selected.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.*.update != null) count += 1;
+        }
+        return count;
+    }
+
     /// What the rows the page is showing are worth.
     pub fn cleanupVisibleBytes(a: *App) u64 {
         var total: u64 = 0;
@@ -626,26 +678,47 @@ pub const App = struct {
 
     /// Remove the ticked items. The work goes to a worker — `brew uninstall`
     /// and `simctl delete` take seconds, and the window must keep drawing —
-    /// and `pollCleanupRemoval` applies what it did.
+    /// and `pollCleanupAction` applies what it did.
     pub fn cleanupDeleteSelected(a: *App) void {
-        a.cleanup_confirm = false;
+        a.cleanup_confirm = .none;
         if (a.cleanup_removing) return;
         if (a.collectRemovals() == 0) return;
 
+        a.cleanup_updating = false;
+        a.startCleanupAction();
+    }
+
+    /// Update the ticked command-line tools, each through its own manager.
+    /// `brew upgrade` and `cargo install` take seconds, so it runs on the
+    /// same worker a removal does.
+    pub fn cleanupUpdateSelected(a: *App) void {
+        a.cleanup_confirm = .none;
+        if (a.cleanup_removing) return;
+        if (a.collectUpdates() == 0) return;
+
+        a.cleanup_updating = true;
+        a.startCleanupAction();
+    }
+
+    fn startCleanupAction(a: *App) void {
         a.cleanup_removal_done.store(false, .release);
         a.cleanup_removing = true;
-        const t = std.Thread.spawn(.{}, cleanupRemoveWorker, .{a}) catch {
+        const t = std.Thread.spawn(.{}, cleanupActionWorker, .{a}) catch {
             // No thread to be had: do it here rather than not at all.
             a.cleanup_removing = false;
-            a.cleanupDeleteNow(null);
+            if (a.cleanup_updating) {
+                a.applyUpdates(a.performUpdates());
+            } else {
+                a.cleanupDeleteNow(null);
+            }
             return;
         };
         a.cleanup_removal_thread = t;
     }
 
-    /// Called once per frame from view.zig while a removal runs. Returns true
-    /// while the page still has to wait for frames.
-    pub fn pollCleanupRemoval(a: *App) bool {
+    /// Called once per frame from view.zig while a removal or an update runs.
+    /// Returns true while the page still has to wait for frames.
+    pub fn pollCleanupAction(a: *App) bool {
         if (!a.cleanup_removing) return false;
         if (!a.cleanup_removal_done.load(.acquire)) return true;
 
@@ -654,10 +727,22 @@ pub const App = struct {
             a.cleanup_removal_thread = null;
         }
         a.cleanup_removing = false;
+        if (a.cleanup_updating) {
+            const report = blk: {
+                a.lockCleanup();
+                defer a.unlockCleanup();
+                const staged = a.cleanup_update_staged orelse UpdateReport{ .failed = a.cleanup_action_items.items.len };
+                a.cleanup_update_staged = null;
+                break :blk staged;
+            };
+            a.cleanup_updating = false;
+            a.applyUpdates(report);
+            return false;
+        }
         const report = blk: {
             a.lockCleanup();
             defer a.unlockCleanup();
-            const staged = a.cleanup_removal_staged orelse RemovalReport{ .failed = a.cleanup_removal_items.items.len };
+            const staged = a.cleanup_removal_staged orelse RemovalReport{ .failed = a.cleanup_action_items.items.len };
             a.cleanup_removal_staged = null;
             break :blk staged;
         };
@@ -668,7 +753,7 @@ pub const App = struct {
     /// The removals, done here and now: the tests' way in (they hand a Trash
     /// inside their own home). The app runs the same work on a worker.
     pub fn cleanupDeleteNow(a: *App, trash: ?*TrashManager) void {
-        a.cleanup_confirm = false;
+        a.cleanup_confirm = .none;
         if (a.cleanup_removing) return;
         if (a.collectRemovals() == 0) return;
 
@@ -677,13 +762,22 @@ pub const App = struct {
             return;
         }
         var own = a.cleanupTrash(a.sampler.io) catch {
-            a.cleanup_removal_items.clearRetainingCapacity();
-            a.cleanup_removal_ok.clearRetainingCapacity();
+            a.cleanup_action_items.clearRetainingCapacity();
+            a.cleanup_action_ok.clearRetainingCapacity();
             a.setCleanupNotice("There is no Trash to move these to.", true);
             return;
         };
         defer own.deinit();
         a.applyRemovals(a.performRemovals(&own));
+    }
+
+    /// The updates, done here and now: the tests' way in, where a removal has
+    /// a Trash handed to it.
+    pub fn cleanupUpdateNow(a: *App) void {
+        a.cleanup_confirm = .none;
+        if (a.cleanup_removing) return;
+        if (a.collectUpdates() == 0) return;
+        a.applyUpdates(a.performUpdates());
     }
 
     /// The Trash removals go to: the user's own, or the tests' temporary one.
@@ -694,24 +788,37 @@ pub const App = struct {
 
     /// Take the ticked items into the removal list, one flag each.
     fn collectRemovals(a: *App) usize {
-        a.cleanup_removal_items.clearRetainingCapacity();
-        a.cleanup_removal_ok.clearRetainingCapacity();
+        a.cleanup_action_items.clearRetainingCapacity();
+        a.cleanup_action_ok.clearRetainingCapacity();
         for (a.cleanup_items.items) |item| {
             if (!a.cleanup_selected.contains(item)) continue;
             if (!item.removal.removable()) continue;
-            a.cleanup_removal_items.append(a.sampler.gpa, item) catch continue;
-            a.cleanup_removal_ok.append(a.sampler.gpa, false) catch {};
+            a.cleanup_action_items.append(a.sampler.gpa, item) catch continue;
+            a.cleanup_action_ok.append(a.sampler.gpa, false) catch {};
         }
-        return a.cleanup_removal_items.items.len;
+        return a.cleanup_action_items.items.len;
+    }
+
+    /// The same, for the ticked tools whose manager can install a newer one.
+    fn collectUpdates(a: *App) usize {
+        a.cleanup_action_items.clearRetainingCapacity();
+        a.cleanup_action_ok.clearRetainingCapacity();
+        for (a.cleanup_items.items) |item| {
+            if (!a.cleanup_selected.contains(item)) continue;
+            if (item.update == null) continue;
+            a.cleanup_action_items.append(a.sampler.gpa, item) catch continue;
+            a.cleanup_action_ok.append(a.sampler.gpa, false) catch {};
+        }
+        return a.cleanup_action_items.items.len;
     }
 
     /// Do the removals. Touches the filesystem and the flags, nothing else,
     /// so it can run on a worker.
     fn performRemovals(a: *App, trash: *TrashManager) RemovalReport {
         var report: RemovalReport = .{};
-        for (a.cleanup_removal_items.items, 0..) |item, i| {
-            const gone = remove.remove(a.sampler.gpa, trash, item) == .removed;
-            if (i < a.cleanup_removal_ok.items.len) a.cleanup_removal_ok.items[i] = gone;
+        for (a.cleanup_action_items.items, 0..) |item, i| {
+            const gone = remove.remove(a.sampler.gpa, trash, item) == .ok;
+            if (i < a.cleanup_action_ok.items.len) a.cleanup_action_ok.items[i] = gone;
             if (!gone) {
                 report.failed += 1;
                 continue;
@@ -722,15 +829,27 @@ pub const App = struct {
         return report;
     }
 
+    /// Do the updates. Every manager is asked to install its newest version,
+    /// one tool at a time: no Trash, no files of ours touched.
+    fn performUpdates(a: *App) UpdateReport {
+        var report: UpdateReport = .{};
+        for (a.cleanup_action_items.items, 0..) |item, i| {
+            const updated = remove.update(a.sampler.gpa, item) == .ok;
+            if (i < a.cleanup_action_ok.items.len) a.cleanup_action_ok.items[i] = updated;
+            if (updated) report.updated += 1 else report.failed += 1;
+        }
+        return report;
+    }
+
     /// Take what went off the page, free it, and say what happened.
     fn applyRemovals(a: *App, report: RemovalReport) void {
         var i: usize = 0;
         while (i < a.cleanup_items.items.len) {
             const item = a.cleanup_items.items[i];
             var gone = false;
-            for (a.cleanup_removal_items.items, 0..) |candidate, at| {
+            for (a.cleanup_action_items.items, 0..) |candidate, at| {
                 if (candidate != item) continue;
-                gone = at < a.cleanup_removal_ok.items.len and a.cleanup_removal_ok.items[at];
+                gone = at < a.cleanup_action_ok.items.len and a.cleanup_action_ok.items[at];
                 break;
             }
             if (gone) {
@@ -742,8 +861,8 @@ pub const App = struct {
             }
             i += 1;
         }
-        a.cleanup_removal_items.clearRetainingCapacity();
-        a.cleanup_removal_ok.clearRetainingCapacity();
+        a.cleanup_action_items.clearRetainingCapacity();
+        a.cleanup_action_ok.clearRetainingCapacity();
 
         var buf: [160]u8 = undefined;
         var size_buf: [32]u8 = undefined;
@@ -760,6 +879,31 @@ pub const App = struct {
             const text = std.fmt.bufPrint(&buf, "Freed {s}; {d} of {d} could not be removed.", .{ size, report.failed, report.failed + report.moved + report.removed }) catch "Some items could not be removed.";
             a.setCleanupNotice(text, true);
         }
+        a.refreshCleanupView();
+        if (a.window) |w| w.redraw();
+    }
+
+    /// An update removes nothing, so every row stays: the ones that went
+    /// through are the version their manager installed, and offer no second
+    /// update until the next scan asks whether one is needed again.
+    pub fn applyUpdates(a: *App, report: UpdateReport) void {
+        for (a.cleanup_action_items.items, 0..) |item, at| {
+            if (at >= a.cleanup_action_ok.items.len) break;
+            if (!a.cleanup_action_ok.items[at]) continue;
+            const installed = item.latest_version orelse item.installed_version;
+            item.setUpdate(null, installed, null) catch {};
+        }
+        a.cleanup_action_items.clearRetainingCapacity();
+        a.cleanup_action_ok.clearRetainingCapacity();
+
+        var buf: [160]u8 = undefined;
+        const text = if (report.failed == 0)
+            std.fmt.bufPrint(&buf, "Updated {d} tool{s}.", .{ report.updated, if (report.updated == 1) "" else "s" }) catch "Updated."
+        else if (report.updated == 0)
+            std.fmt.bufPrint(&buf, "{d} tool{s} could not be updated.", .{ report.failed, if (report.failed == 1) "" else "s" }) catch "Nothing was updated."
+        else
+            std.fmt.bufPrint(&buf, "Updated {d}; {d} could not be updated.", .{ report.updated, report.failed }) catch "Some tools were updated.";
+        a.setCleanupNotice(text, report.failed > 0);
         a.refreshCleanupView();
         if (a.window) |w| w.redraw();
     }
@@ -822,13 +966,13 @@ pub const App = struct {
             t.join();
             a.cleanup_thread = null;
         }
-        // So may a removal.
+        // So may a removal or an update.
         if (a.cleanup_removal_thread) |t| {
             t.join();
             a.cleanup_removal_thread = null;
         }
-        a.cleanup_removal_items.deinit(a.sampler.gpa);
-        a.cleanup_removal_ok.deinit(a.sampler.gpa);
+        a.cleanup_action_items.deinit(a.sampler.gpa);
+        a.cleanup_action_ok.deinit(a.sampler.gpa);
         for (a.cleanup_staging.items) |item| {
             item.deinit();
             a.sampler.gpa.destroy(item);

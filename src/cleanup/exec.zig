@@ -32,13 +32,26 @@ pub const Answer = struct {
 /// Run `argv[0]` and return its standard output (the caller frees it). An
 /// empty slice means the command could not be run or said nothing.
 pub fn run(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    return (try runOk(allocator, argv)).out;
+    return runEnv(allocator, argv, &.{});
+}
+
+/// The same, with environment entries of the caller's own (`KEY=VALUE`),
+/// which replace the ones nanomon hands every child. `brew` is told not to
+/// update itself (that alone can take ten seconds), and `pnpm` is told where
+/// its own binaries are, or it refuses to answer at all.
+pub fn runEnv(allocator: std.mem.Allocator, argv: []const []const u8, extra_env: []const []const u8) ![]u8 {
+    return (try runOkEnv(allocator, argv, extra_env)).out;
 }
 
 /// Run `argv[0]`, and say whether it worked as well as what it said. The
 /// removals that go through a tool (simctl, xcodebuild, brew, tmutil) are
 /// judged by the exit status, not by the output.
 pub fn runOk(allocator: std.mem.Allocator, argv: []const []const u8) !Answer {
+    return runOkEnv(allocator, argv, &.{});
+}
+
+/// The same, with environment entries of the caller's own.
+pub fn runOkEnv(allocator: std.mem.Allocator, argv: []const []const u8, extra_env: []const []const u8) !Answer {
     if (!posix or argv.len == 0) return .{ .out = try allocator.alloc(u8, 0), .ok = false };
 
     // posix_spawn wants null-terminated strings; they live for the call only.
@@ -63,7 +76,7 @@ pub fn runOk(allocator: std.mem.Allocator, argv: []const []const u8) !Answer {
     _ = posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
     _ = posix_spawn_file_actions_addclose(&fa, fds[0]);
 
-    var envp = try childEnv(arena.allocator());
+    var envp = try childEnv(arena.allocator(), extra_env);
 
     var pid: c_int = 0;
     const rc = posix_spawn(&pid, args[0].?, @ptrCast(&fa), null, @ptrCast(args.ptr), &envp);
@@ -95,12 +108,15 @@ pub fn runOk(allocator: std.mem.Allocator, argv: []const []const u8) !Answer {
 
 /// The environment a tool needs to work: `brew`, `xcrun` and `tmutil` all
 /// look for `$HOME`, and brew will not run at all without it.
-fn childEnv(arena: std.mem.Allocator) !Env {
+fn childEnv(arena: std.mem.Allocator, extra: []const []const u8) !Env {
     var env: Env = undefined;
     var n: usize = 0;
     const names = [_][]const u8{ "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "SHELL" };
     for (names) |name| {
         if (n == env.len - 1) break;
+        // The caller's entry, when it has one, is the one that counts: a
+        // child with two PATHs is not a child with a choice.
+        if (replaced(name, extra)) continue;
         const key = try arena.allocSentinel(u8, name.len, 0);
         @memcpy(key, name);
         const value = getenv(key.ptr) orelse continue;
@@ -110,18 +126,81 @@ fn childEnv(arena: std.mem.Allocator) !Env {
         env[n] = line.ptr;
         n += 1;
     }
+    for (extra) |entry| {
+        if (n == env.len - 1) break;
+        const line = try arena.allocSentinel(u8, entry.len, 0);
+        @memcpy(line, entry);
+        env[n] = line.ptr;
+        n += 1;
+    }
     env[n] = null;
     return env;
 }
 
+/// Whether the caller's own environment carries this name.
+fn replaced(name: []const u8, extra: []const []const u8) bool {
+    for (extra) |entry| {
+        if (entry.len > name.len and entry[name.len] == '=' and std.mem.eql(u8, entry[0..name.len], name)) return true;
+    }
+    return false;
+}
+
 /// Room for the environment nanomon hands a tool.
-const Env = [8:null]?[*:0]const u8;
+const Env = [16:null]?[*:0]const u8;
+
+extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+
+/// Where a tool that has no fixed home is looked for, after `$PATH`.
+const tool_dirs = [_][]const u8{ "/opt/homebrew/bin", "/usr/local/bin", "/opt/homebrew/sbin" };
+
+/// The same, relative to the home folder: cargo's, bun's, pipx's, and the
+/// user's own bin folders. A window opened from the Dock has none of these
+/// on its `PATH`.
+const home_tool_dirs = [_][]const u8{ ".cargo/bin", ".bun/bin", ".local/bin", "bin", "Library/pnpm/bin" };
+
+/// Find an executable by name, or null. `scratch` holds the path being
+/// tried; the answer points into it, and is valid until the next call.
+pub fn which(name: []const u8, scratch: []u8) ?[]const u8 {
+    if (!posix) return null;
+    if (getenv("PATH")) |path| {
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(path), ':');
+        while (it.next()) |dir| {
+            if (executableIn(dir, name, scratch)) |found| return found;
+        }
+    }
+    for (tool_dirs) |dir| {
+        if (executableIn(dir, name, scratch)) |found| return found;
+    }
+    const home = if (getenv("HOME")) |value| std.mem.span(value) else return null;
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for (home_tool_dirs) |relative| {
+        const dir = std.fmt.bufPrint(&dir_buffer, "{s}/{s}", .{ home, relative }) catch continue;
+        if (executableIn(dir, name, scratch)) |found| return found;
+    }
+    return null;
+}
+
+/// `<dir>/<name>`, when it is there and may be run.
+fn executableIn(dir: []const u8, name: []const u8, scratch: []u8) ?[]const u8 {
+    const path = std.fmt.bufPrint(scratch, "{s}/{s}", .{ dir, name }) catch return null;
+    const z = std.heap.page_allocator.allocSentinel(u8, path.len, 0) catch return null;
+    defer std.heap.page_allocator.free(z);
+    @memcpy(z, path);
+    // X_OK: executable by this process.
+    if (access(z.ptr, 1) != 0) return null;
+    return path;
+}
 
 /// The JSON in what a command said, without the warnings around it. Tools
 /// write "Warning: …" to the same pipe, and a parser will not take the lot.
+/// An answer can be an object (`brew info`) or an array (`pnpm ls -g`), so
+/// the closer that matches the opener is the one looked for.
 pub fn jsonSlice(out: []const u8) []const u8 {
-    const open = std.mem.indexOfScalar(u8, out, '{') orelse return out;
-    const shut = std.mem.lastIndexOfScalar(u8, out, '}') orelse return out;
+    const brace = std.mem.indexOfScalar(u8, out, '{');
+    const bracket = std.mem.indexOfScalar(u8, out, '[');
+    const braces = (brace orelse out.len) <= (bracket orelse out.len);
+    const open = (if (braces) brace else bracket) orelse return out;
+    const shut = (if (braces) std.mem.lastIndexOfScalar(u8, out, '}') else std.mem.lastIndexOfScalar(u8, out, ']')) orelse return out;
     if (shut <= open) return out;
     return out[open .. shut + 1];
 }
@@ -153,5 +232,8 @@ test "a command's answer comes back, and a missing one does not fail" {
 test "the JSON is found among the warnings" {
     try std.testing.expectEqualStrings("{\"a\":1}", jsonSlice("Warning: something\n{\"a\":1}\n"));
     try std.testing.expectEqualStrings("{}", jsonSlice("{}"));
+    // An array answer, and an object with an array inside it.
+    try std.testing.expectEqualStrings("[{\"a\":1}]", jsonSlice("warn\n[{\"a\":1}]\n"));
+    try std.testing.expectEqualStrings("{\"a\":[1,2]}", jsonSlice("{\"a\":[1,2]}"));
     try std.testing.expectEqualStrings("no json here", jsonSlice("no json here"));
 }

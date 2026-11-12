@@ -6,3 +6,4 @@ zig-out/
 codedb.snapshot
 .DS_Store
 zig-pkg/
+.omx/

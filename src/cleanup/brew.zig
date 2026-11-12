@@ -1,6 +1,7 @@
-//! What Homebrew installed: the casks, which are apps, and the formulae,
-//! which are command-line tools. Homebrew removes them for good — they do not
-//! go to the Trash — so every row says so before it is removed.
+//! The casks Homebrew installed: the apps it put in Applications. Its
+//! formulae — the command-line tools — are `cli.zig`'s business, with every
+//! other manager's. Homebrew removes what it installed for good: it does not
+//! go to the Trash, so every row says so before it is removed.
 const std = @import("std");
 const item_mod = @import("item.zig");
 const CacheItem = item_mod.CacheItem;
@@ -10,8 +11,15 @@ const remove = @import("remove.zig");
 
 pub const Options = struct {
     max_casks: usize = 120,
-    max_formulae: usize = 120,
+    /// Where each chunk of casks goes the moment brew has answered for it, so
+    /// the page fills in while the rest are asked about. The scanner measures
+    /// them and hands them on; null keeps them here.
+    batch: ?item_mod.Batch = null,
 };
+
+/// The environment entries every `brew` call carries: brew must not update
+/// itself in the middle of a scan, and it need not explain its own hints.
+pub const env = [_][]const u8{ "HOMEBREW_NO_AUTO_UPDATE=1", "HOMEBREW_NO_ENV_HINTS=1" };
 
 /// The casks, as app rows: the .app Homebrew put in Applications.
 pub fn scanCasks(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.ArrayListUnmanaged(*CacheItem) {
@@ -46,12 +54,13 @@ pub fn scanCasks(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.A
     const began = std.Io.Clock.now(.awake, io).nanoseconds;
     const budget_ns: i96 = 4 * std.time.ns_per_s;
     var start: usize = 0;
+    var found: usize = 0;
     var refused: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (refused.items) |name| allocator.free(name);
         refused.deinit(allocator);
     }
-    while (start < tokens.items.len and items.items.len < opts.max_casks) : (start += chunk) {
+    while (start < tokens.items.len and found < opts.max_casks) : (start += chunk) {
         const end = @min(start + chunk, tokens.items.len);
         const slice = tokens.items[start..end];
         // One bad cask (an untrusted tap, a broken install) makes brew refuse
@@ -60,11 +69,15 @@ pub fn scanCasks(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.A
         var remaining: std.ArrayListUnmanaged([]const u8) = .empty;
         defer remaining.deinit(allocator);
         try remaining.appendSlice(allocator, slice);
+        // What this chunk may still add, so the cap holds exactly however the
+        // rows are handed over.
+        var chunk_opts = opts;
+        chunk_opts.max_casks = opts.max_casks - found;
         var attempt: usize = 0;
         while (attempt < 5 and remaining.items.len > 0) : (attempt += 1) {
             if (attempt > 0 and std.Io.Clock.now(.awake, io).nanoseconds - began > budget_ns) break;
             const known = refused.items.len;
-            if (try addCasks(allocator, brew, remaining.items, opts, &items, &refused)) break;
+            if (try addCasks(allocator, brew, remaining.items, chunk_opts, &items, &refused)) break;
             if (refused.items.len == known) break;
             var keep: std.ArrayListUnmanaged([]const u8) = .empty;
             defer keep.deinit(allocator);
@@ -74,6 +87,12 @@ pub fn scanCasks(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.A
             remaining.clearRetainingCapacity();
             try remaining.appendSlice(allocator, keep.items);
         }
+        // A chunk brew has answered for is complete: measure it and show it
+        // while the next chunk is asked about.
+        if (opts.batch) |b| {
+            found += items.items.len;
+            b.give(b.ctx, .app, &items);
+        } else found = items.items.len;
     }
     return items;
 }
@@ -93,7 +112,9 @@ fn addCasks(
     try argv.appendSlice(allocator, &.{ brew, "info", "--cask", "--json=v2" });
     try argv.appendSlice(allocator, tokens);
 
-    const answer = exec.runOk(allocator, argv.items) catch return false;
+    // brew is told not to update itself: that alone can take ten seconds in
+    // the middle of a scan.
+    const answer = exec.runOkEnv(allocator, argv.items, &env) catch return false;
     defer allocator.free(answer.out);
     if (!answer.ok) {
         try noteRefused(allocator, answer.out, refused);
@@ -170,60 +191,6 @@ fn isRefused(refused: []const []const u8, token: []const u8) bool {
     return false;
 }
 
-/// The formulae, as command-line tools. Their size is their Cellar folder,
-/// measured with everything else.
-pub fn scanFormulae(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.ArrayListUnmanaged(*CacheItem) {
-    var items = std.ArrayListUnmanaged(*CacheItem).empty;
-    errdefer discard(allocator, &items);
-    const brew = remove.brewPath() orelse return items;
-
-    const cellar = try cellarOf(allocator, brew);
-    defer allocator.free(cellar);
-
-    const listed = exec.run(allocator, &.{ brew, "list", "--formula" }) catch return items;
-    defer allocator.free(listed);
-
-    var lines = std.mem.tokenizeScalar(u8, listed, '\n');
-    while (lines.next()) |line| {
-        if (items.items.len >= opts.max_formulae) break;
-        const name = std.mem.trim(u8, line, " \t\r");
-        if (name.len == 0) continue;
-        const path = try std.fs.path.join(allocator, &.{ cellar, name });
-        defer allocator.free(path);
-        if (!isDir(io, path)) continue;
-
-        const id = try std.fmt.allocPrint(allocator, "brew-formula:{s}", .{name});
-        defer allocator.free(id);
-        const explanation = try std.fmt.allocPrint(allocator, "A command-line tool Homebrew installed. `brew uninstall {s}` removes it for good — it does not go to the Trash.", .{name});
-        defer allocator.free(explanation);
-        const reinstall = try std.fmt.allocPrint(allocator, "brew install {s}", .{name});
-        defer allocator.free(reinstall);
-        try items.append(allocator, try CacheItem.create(allocator, .{
-            .id = id,
-            .name = name,
-            .info = .{
-                .level = .medium,
-                .headline = "Homebrew tool",
-                .explanation = explanation,
-                .recovery_steps = reinstall,
-                .reinstall_command = reinstall,
-            },
-            .category = .brew,
-            .path = path,
-            .where = "Cellar",
-            .removal = .brew_formula,
-            .target = name,
-        }));
-    }
-    return items;
-}
-
-/// Homebrew's Cellar: the folder each formula keeps its files in.
-fn cellarOf(allocator: std.mem.Allocator, brew: []const u8) ![]u8 {
-    const prefix = std.fs.path.dirname(std.fs.path.dirname(brew) orelse "/opt/homebrew") orelse "/opt/homebrew";
-    return std.fs.path.join(allocator, &.{ prefix, "Cellar" });
-}
-
 /// The .app a cask installs, from its artifacts.
 fn appTarget(cask: std.json.ObjectMap) ?[]const u8 {
     const artifacts = cask.get("artifacts") orelse return null;
@@ -255,28 +222,12 @@ fn exists(path: []const u8) bool {
     return access(copy.ptr, 0) == 0;
 }
 
-fn isDir(io: std.Io, path: []const u8) bool {
-    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
-    dir.close(io);
-    return true;
-}
-
 fn discard(allocator: std.mem.Allocator, items: *std.ArrayListUnmanaged(*CacheItem)) void {
     for (items.items) |item| {
         item.deinit();
         allocator.destroy(item);
     }
     items.deinit(allocator);
-}
-
-test "the Cellar sits beside the brew that lives in it" {
-    const allocator = std.testing.allocator;
-    const arm = try cellarOf(allocator, "/opt/homebrew/bin/brew");
-    defer allocator.free(arm);
-    try std.testing.expectEqualStrings("/opt/homebrew/Cellar", arm);
-    const intel = try cellarOf(allocator, "/usr/local/bin/brew");
-    defer allocator.free(intel);
-    try std.testing.expectEqualStrings("/usr/local/Cellar", intel);
 }
 
 test "casks are apps Homebrew put in Applications" {

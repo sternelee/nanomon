@@ -270,6 +270,8 @@ pub const dev_caches = [_]Target{
     .{ .path = ".npm/_cacache", .info = SafetyInfo.safe("npm cache", "npm re-fetches packages when needed.") },
     .{ .path = ".yarn/cache", .info = SafetyInfo.safe("Yarn cache", "Yarn re-fetches packages when needed.") },
     .{ .path = ".pnpm-store", .info = SafetyInfo.safe("pnpm store", "pnpm re-fetches packages when needed.") },
+    .{ .path = "Library/pnpm/store", .info = SafetyInfo.safe("pnpm store", "pnpm re-fetches packages when needed.") },
+    .{ .path = ".bun/install/cache", .info = SafetyInfo.safe("bun install cache", "bun re-downloads packages when needed.") },
     .{ .path = ".cache/pip", .info = SafetyInfo.safe("pip cache", "pip re-downloads packages when needed.") },
     .{ .path = ".cache/go-build", .info = SafetyInfo.safe("Go build cache", "Go rebuilds it on the next build.") },
     .{ .path = ".cache/uv", .info = SafetyInfo.safe("uv cache", "uv re-downloads packages when needed.") },

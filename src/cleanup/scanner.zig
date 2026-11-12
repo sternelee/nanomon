@@ -18,6 +18,7 @@ const apps = @import("apps.zig");
 const simulators = @import("simulators.zig");
 const xcode = @import("xcode.zig");
 const brew = @import("brew.zig");
+const cli = @import("cli.zig");
 const snapshots = @import("snapshots.zig");
 const diskmap = @import("diskmap.zig");
 
@@ -25,11 +26,20 @@ const builtin = @import("builtin");
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
+/// How many rows pile up before a pass hands them over: small enough that the
+/// page moves while a long pass runs, large enough to keep the measuring
+/// threads busy.
+const stream_batch: usize = 16;
+
 pub const CacheScanner = struct {
     allocator: std.mem.Allocator,
     policy: SafetyPolicy,
     home_dir: []const u8,
     io: std.Io,
+    /// Where a pass's rows go as it finds them. Null: the pass keeps them and
+    /// the caller owns them (a test's scan, which wants one list at the end).
+    sink: ?*const fn (ctx: *anyopaque, item: *CacheItem) void = null,
+    sink_ctx: ?*anyopaque = null,
     /// App caches under this size are noise on the page, not space to win back.
     min_bytes: u64 = 1 << 20,
     /// A defensive cap on how many items one scan may produce.
@@ -52,7 +62,9 @@ pub const CacheScanner = struct {
     /// How many of each of the tool-found things to keep, biggest first.
     max_simulators: usize = 80,
     max_casks: usize = 120,
-    max_formulae: usize = 120,
+    /// How many command-line tools one manager may contribute. A tool is a
+    /// row whether or not it is big, so they are not trimmed to the biggest.
+    max_tools: usize = 400,
     max_snapshots: usize = 40,
     /// The overview's folders are huge: a smaller bound is enough to say
     /// where the space went.
@@ -117,7 +129,7 @@ pub const CacheScanner = struct {
             scanSimulators,
             scanXcodeComponents,
             scanBrewCasks,
-            scanBrewFormulae,
+            scanCliTools,
             scanSnapshots,
             scanDiskMap,
         };
@@ -149,15 +161,21 @@ pub const CacheScanner = struct {
         defer dir.close(self.io);
 
         var it = dir.iterate();
+        var found: usize = 0;
         while (try it.next(self.io)) |entry| {
             if (self.cancelled()) break;
             if (entry.kind != .directory) continue;
-            if (items.items.len >= self.max_items) break;
+            if (found >= self.max_items) break;
             const info = safety.classifyCacheFolder(entry.name);
             if (!info.level.canSurfaceInScanResults()) continue;
             const full = try std.fs.path.join(self.allocator, &.{ caches, entry.name });
             defer self.allocator.free(full);
+            const before = items.items.len;
             try self.addUnmeasured(&items, .cache, full, entry.name, "Caches", info);
+            if (items.items.len > before) {
+                found += 1;
+                self.streamBatch(&items, .cache);
+            }
         }
         self.finish(&items, .cache, 0);
         return items;
@@ -183,10 +201,11 @@ pub const CacheScanner = struct {
         const containers = [_][]const u8{ "", "Default", "User Data", "Profile 1" };
 
         var it = dir.iterate();
+        var found: usize = 0;
         while (try it.next(self.io)) |app| {
             if (self.cancelled()) break;
             if (app.kind != .directory) continue;
-            if (items.items.len >= self.max_items) break;
+            if (found >= self.max_items) break;
             const app_path = try std.fs.path.join(self.allocator, &.{ support, app.name });
             defer self.allocator.free(app_path);
 
@@ -203,12 +222,17 @@ pub const CacheScanner = struct {
                 while (try kids.next(self.io)) |kid| {
                     if (self.cancelled()) break;
                     if (kid.kind != .directory) continue;
-                    if (items.items.len >= self.max_items) break;
+                    if (found >= self.max_items) break;
                     const info = safety.classifyAppSupportChild(kid.name);
                     if (!info.level.canSurfaceInScanResults()) continue;
                     const full = try std.fs.path.join(self.allocator, &.{ base, kid.name });
                     defer self.allocator.free(full);
+                    const before = items.items.len;
                     try self.addUnmeasured(&items, .cache, full, kid.name, app.name, info);
+                    if (items.items.len > before) {
+                        found += 1;
+                        self.streamBatch(&items, .cache);
+                    }
                 }
             }
         }
@@ -245,12 +269,15 @@ pub const CacheScanner = struct {
     /// inside each one the catalog knows.
     pub fn scanProjects(self: *CacheScanner) !std.ArrayListUnmanaged(*CacheItem) {
         var state = ProjectWalk{ .items = .empty, .seen = .empty };
-        errdefer {
-            self.discard(&state.items);
+        defer {
+            // The paths are the map's own: a row handed over mid-walk leaves
+            // the map behind, so it cannot be the key.
+            var keys = state.seen.keyIterator();
+            while (keys.next()) |key| self.allocator.free(key.*);
             state.seen.deinit(self.allocator);
         }
+        errdefer self.discard(&state.items);
         self.walkProjectDirs(self.home_dir, 0, &state);
-        state.seen.deinit(self.allocator);
         self.finish(&state.items, .project, self.max_project_items);
         return state.items;
     }
@@ -261,6 +288,7 @@ pub const CacheScanner = struct {
             .home = self.home_dir,
             .min_bytes = self.min_large_bytes,
             .max_items = self.max_large_items,
+            .batch = self.batch(),
         });
         self.finish(&items, .large, self.max_large_items);
         return items;
@@ -272,6 +300,7 @@ pub const CacheScanner = struct {
             .home = self.home_dir,
             .roots = self.apps_roots,
             .max_items = self.max_apps,
+            .batch = self.batch(),
         });
         self.finish(&items, .app, self.max_apps);
         return items;
@@ -296,16 +325,25 @@ pub const CacheScanner = struct {
     /// The apps Homebrew installed, which only Homebrew should take away.
     pub fn scanBrewCasks(self: *CacheScanner) !std.ArrayListUnmanaged(*CacheItem) {
         if (!self.machine) return .empty;
-        var items = try brew.scanCasks(self.allocator, self.io, .{ .max_casks = self.max_casks });
+        var items = try brew.scanCasks(self.allocator, self.io, .{ .max_casks = self.max_casks, .batch = self.batch() });
         self.finish(&items, .app, self.max_casks);
         return items;
     }
 
-    /// The command-line tools Homebrew installed.
-    pub fn scanBrewFormulae(self: *CacheScanner) !std.ArrayListUnmanaged(*CacheItem) {
-        if (!self.machine) return .empty;
-        var items = try brew.scanFormulae(self.allocator, self.io, .{ .max_formulae = self.max_formulae });
-        self.finish(&items, .brew, self.max_formulae);
+    /// The command-line tools the machine has, and their newer versions:
+    /// Homebrew's formulae, npm's, pnpm's and bun's global packages, pipx's
+    /// environments, cargo's binaries, and the programs downloaded into the
+    /// user's own bin folders.
+    pub fn scanCliTools(self: *CacheScanner) !std.ArrayListUnmanaged(*CacheItem) {
+        var items = try cli.scan(self.allocator, self.io, .{
+            .home = self.home_dir,
+            .machine = self.machine,
+            .max_per_manager = self.max_tools,
+            .batch = self.batch(),
+        });
+        // Every tool is a row, however small: this page is about what is
+        // installed, not about the biggest few.
+        self.finish(&items, .cli, 0);
         return items;
     }
 
@@ -335,13 +373,16 @@ pub const CacheScanner = struct {
 
     const ProjectWalk = struct {
         items: std.ArrayListUnmanaged(*CacheItem),
+        /// Every folder proposed, the ones already handed over included: the
+        /// walk's own bound, which the batch in `items` cannot be.
+        proposed: usize = 0,
         seen: std.StringHashMapUnmanaged(void),
         dirs_visited: usize = 0,
     };
 
     fn walkProjectDirs(self: *CacheScanner, path: []const u8, depth: usize, st: *ProjectWalk) void {
         if (self.cancelled()) return;
-        if (st.dirs_visited >= self.max_dirs_visited or st.items.items.len >= self.max_project_items) return;
+        if (st.dirs_visited >= self.max_dirs_visited or st.proposed >= self.max_project_items) return;
         st.dirs_visited += 1;
 
         var dir = std.Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true }) catch return;
@@ -377,7 +418,7 @@ pub const CacheScanner = struct {
 
     fn proposeProjectItems(self: *CacheScanner, root: []const u8, files: []const []const u8, st: *ProjectWalk) void {
         for (safety.project_rules) |rule| {
-            if (st.items.items.len >= self.max_project_items) return;
+            if (st.proposed >= self.max_project_items) return;
             if (!self.ruleMatches(root, rule, files)) continue;
 
             const full = std.fs.path.join(self.allocator, &.{ root, rule.folder }) catch continue;
@@ -395,11 +436,16 @@ pub const CacheScanner = struct {
             };
             const name = std.fs.path.basename(rule.folder);
             const project = std.fs.path.basename(root);
+            // The path is remembered before the row is made, and the map owns
+            // its own copy: the row may be handed over in the next batch.
+            const key = self.allocator.dupe(u8, full) catch continue;
+            st.seen.put(self.allocator, key, {}) catch {
+                self.allocator.free(key);
+                continue;
+            };
             self.addUnmeasured(&st.items, .project, full, name, project, info) catch continue;
-            if (st.items.items.len > 0) {
-                const added = st.items.items[st.items.items.len - 1];
-                st.seen.put(self.allocator, added.primaryPath(), {}) catch {};
-            }
+            st.proposed += 1;
+            self.streamBatch(&st.items, .project);
         }
     }
 
@@ -474,10 +520,11 @@ pub const CacheScanner = struct {
         try items.append(self.allocator, item);
     }
 
-    /// Measure the candidates (in parallel: the folders are independent) and
-    /// drop the ones that hold nothing, or too little to be worth a row.
-    /// `max_keep` trims what is left to the biggest few (0 keeps them all).
-    fn finish(self: *CacheScanner, items: *std.ArrayListUnmanaged(*CacheItem), category: Category, max_keep: usize) void {
+    /// Measure the candidates (in parallel: the folders are independent), drop
+    /// the ones that hold nothing or too little to be worth a row, and hand
+    /// what is left to the sink. A scan with no sink keeps its rows: the pass
+    /// returns them and the caller owns them.
+    fn publish(self: *CacheScanner, items: *std.ArrayListUnmanaged(*CacheItem), category: Category) void {
         self.measureAll(items.items);
         var keep: usize = 0;
         for (items.items) |item| {
@@ -495,6 +542,37 @@ pub const CacheScanner = struct {
         }
         items.shrinkRetainingCapacity(keep);
 
+        const sink = self.sink orelse return;
+        for (items.items) |item| sink(self.sink_ctx.?, item);
+        items.clearRetainingCapacity();
+    }
+
+    /// Hand a batch over in the middle of a pass, once it is worth showing.
+    /// Nothing happens without a sink: the pass keeps its rows and `finish`
+    /// measures them all at once.
+    fn streamBatch(self: *CacheScanner, items: *std.ArrayListUnmanaged(*CacheItem), category: Category) void {
+        if (self.sink == null or items.items.len < stream_batch) return;
+        self.publish(items, category);
+    }
+
+    /// The scanner's side of a module's batch: its rows are measured and
+    /// handed on the same way a pass's own are. A scan with no sink hands out
+    /// nothing, so the module keeps its rows and the pass returns them.
+    fn batch(self: *CacheScanner) ?item_mod.Batch {
+        if (self.sink == null) return null;
+        return .{ .ctx = self, .give = &takeBatch };
+    }
+
+    fn takeBatch(ctx: *anyopaque, category: Category, items: *std.ArrayListUnmanaged(*CacheItem)) void {
+        const self: *CacheScanner = @ptrCast(@alignCast(ctx));
+        if (items.items.len == 0) return;
+        self.publish(items, category);
+    }
+
+    /// Measure the candidates and keep what is worth a row. `max_keep` trims
+    /// what is left to the biggest few (0 keeps them all).
+    fn finish(self: *CacheScanner, items: *std.ArrayListUnmanaged(*CacheItem), category: Category, max_keep: usize) void {
+        self.publish(items, category);
         if (max_keep == 0 or items.items.len <= max_keep) return;
         std.sort.pdq(*CacheItem, items.items, {}, struct {
             fn less(_: void, lhs: *CacheItem, rhs: *CacheItem) bool {
@@ -537,6 +615,9 @@ pub const CacheScanner = struct {
                         loc.size_bytes = size.bytes;
                         loc.approx = size.truncated;
                     }
+                    // Walked once, however many times a pass publishes: a
+                    // batch handed over mid-pass is measured already.
+                    item.sized = true;
                 }
             }
         };

@@ -12,6 +12,7 @@ pub const Tab = enum {
     overview,
     caches,
     dev,
+    cli,
     large,
     uninstall,
 
@@ -20,6 +21,7 @@ pub const Tab = enum {
             .overview => "Overview",
             .caches => "App Caches",
             .dev => "Dev Tools",
+            .cli => "CLI Tools",
             .large => "Large Files",
             .uninstall => "App Uninstaller",
         };
@@ -30,6 +32,7 @@ pub const Tab = enum {
             .overview => "chart.bar.xaxis",
             .caches => "internaldrive",
             .dev => "chevron.left.forwardslash.chevron.right",
+            .cli => "terminal",
             .large => "doc",
             .uninstall => "xmark.square",
         };
@@ -41,6 +44,7 @@ pub const Tab = enum {
             .overview => "Where the space went, read-only",
             .caches => "Caches, logs and the junk apps leave behind",
             .dev => "Tool caches and the build folders inside projects",
+            .cli => "The tools you installed, and their newer versions",
             .large => "The biggest files in your folders",
             .uninstall => "An app, and everything it left in your Library",
         };
@@ -63,6 +67,16 @@ pub const Removal = enum {
     brew_formula,
     /// `brew uninstall --cask <target>`
     brew_cask,
+    /// `npm uninstall -g <target>`
+    npm_global,
+    /// `pnpm remove -g <target>`
+    pnpm_global,
+    /// `bun remove -g <target>`
+    bun_global,
+    /// `pipx uninstall <target>`
+    pipx_venv,
+    /// `cargo uninstall <target>`
+    cargo_install,
     /// `tmutil deletelocalsnapshots <target>`
     tm_snapshot,
     /// Read-only: nothing here removes this, it is only measured.
@@ -85,9 +99,33 @@ pub const Removal = enum {
             .simctl_runtime, .simctl_device => "Delete",
             .xcode_component => "Remove",
             .brew_formula, .brew_cask => "Uninstall",
+            .npm_global, .pnpm_global, .bun_global, .pipx_venv, .cargo_install => "Uninstall",
             .tm_snapshot => "Delete",
             .none => "Keep",
         };
+    }
+};
+
+/// How a command-line tool is updated: the manager that installed it knows,
+/// and each one is asked for the newest version it offers.
+pub const Update = enum {
+    /// `brew upgrade <target>`
+    brew_upgrade,
+    /// `npm install -g <target>@latest`
+    npm_latest,
+    /// `pnpm update -g --latest <target>`
+    pnpm_latest,
+    /// `bun update -g --latest <target>`
+    bun_latest,
+    /// `pipx upgrade <target>`
+    pipx_upgrade,
+    /// `cargo install <target>`
+    cargo_install,
+
+    /// The word the sheet and the footer use.
+    pub fn verb(self: Update) []const u8 {
+        _ = self;
+        return "Update";
     }
 };
 
@@ -105,12 +143,13 @@ pub const Category = enum {
     large,
     /// An installed app, with what it left in the Library.
     app,
+    /// A command-line tool a package manager installed, or one that was
+    /// simply downloaded into a folder of the user's.
+    cli,
     /// A simulator runtime or a simulator device.
     simulator,
     /// An Xcode component that can be downloaded again.
     xcode,
-    /// A tool Homebrew installed.
-    brew,
     /// Something read-only on the overview: a folder, or a whole category.
     other,
 
@@ -122,9 +161,9 @@ pub const Category = enum {
             .project => "Project",
             .large => "File",
             .app => "App",
+            .cli => "CLI Tool",
             .simulator => "Simulator",
             .xcode => "Xcode",
-            .brew => "Homebrew",
             .other => "Folder",
         };
     }
@@ -133,12 +172,24 @@ pub const Category = enum {
     pub fn tab(self: Category) Tab {
         return switch (self) {
             .cache, .junk => .caches,
-            .dev, .project, .simulator, .xcode, .brew => .dev,
+            .dev, .project, .simulator, .xcode => .dev,
+            .cli => .cli,
             .large => .large,
             .app => .uninstall,
             .other => .overview,
         };
     }
+};
+
+/// Where a pass's rows go the moment they are made, so a long pass fills the
+/// page in while it runs: the scanner measures what it is handed, drops what
+/// is not worth a row, and passes the rest on. A scan with no sink (a test's)
+/// keeps its rows and measures them once the pass is done.
+pub const Batch = struct {
+    ctx: *anyopaque,
+    /// Take these items; the caller must not keep them, and must not free them
+    /// either: they belong to the scanner now.
+    give: *const fn (ctx: *anyopaque, category: Category, items: *std.ArrayListUnmanaged(*CacheItem)) void,
 };
 
 /// A single location within a cache item (multiple locations can be merged)
@@ -174,6 +225,14 @@ pub const CacheItem = struct {
     /// a component name, a snapshot date). `.trash` needs no target.
     removal: Removal = .trash,
     removal_target: ?[]const u8 = null,
+    /// How a command-line tool is updated, and what that update aims at.
+    /// `null` for everything that is not a tool a manager installed.
+    update: ?Update = null,
+    /// What is installed, for the Version column.
+    installed_version: ?[]const u8 = null,
+    /// The version its own update command would install, when there is a
+    /// newer one. `null` when the tool is up to date, or nothing knows.
+    latest_version: ?[]const u8 = null,
     /// False for something whose size cannot be measured (a Time Machine
     /// snapshot): the page shows a dash rather than a made-up number.
     measured: bool = true,
@@ -190,6 +249,11 @@ pub const CacheItem = struct {
             total += loc.size_bytes;
         }
         return total;
+    }
+
+    /// Whether its manager offers a newer version.
+    pub fn outdated(self: *const CacheItem) bool {
+        return self.latest_version != null;
     }
 
     /// Most recent last modified time
@@ -223,6 +287,13 @@ pub const CacheItem = struct {
             .cache => self.category.title(),
             else => self.safety_info.headline,
         };
+    }
+
+    /// What the Where column says: the folder the first location named — for
+    /// a command-line tool, the manager that installed it.
+    pub fn where(self: *const CacheItem) []const u8 {
+        if (self.locations.items.len == 0) return "";
+        return self.locations.items[0].folder_name;
     }
 
     /// Format size as human-readable string
@@ -291,6 +362,19 @@ pub const CacheItem = struct {
         self.removal = removal;
     }
 
+    /// Say how this item is updated, what is installed, and what its manager
+    /// would install instead (`null` when there is nothing newer).
+    pub fn setUpdate(self: *CacheItem, update: ?Update, installed: ?[]const u8, latest: ?[]const u8) !void {
+        const installed_copy = if (installed) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (installed_copy) |copy| self.allocator.free(copy);
+        const latest_copy = if (latest) |value| try self.allocator.dupe(u8, value) else null;
+        if (self.installed_version) |old| self.allocator.free(old);
+        if (self.latest_version) |old| self.allocator.free(old);
+        self.update = update;
+        self.installed_version = installed_copy;
+        self.latest_version = latest_copy;
+    }
+
     /// What the page needs to build a row.
     pub const Spec = struct {
         id: []const u8,
@@ -307,6 +391,9 @@ pub const CacheItem = struct {
         unknown_size: bool = false,
         removal: Removal = .trash,
         target: ?[]const u8 = null,
+        update: ?Update = null,
+        installed_version: ?[]const u8 = null,
+        latest_version: ?[]const u8 = null,
     };
 
     /// Build an item with one location. The caller owns the result.
@@ -320,6 +407,7 @@ pub const CacheItem = struct {
         item.sized = spec.sized;
         try item.addLocationSized(spec.path, spec.size, 0, spec.where, false);
         try item.setRemoval(spec.removal, spec.target);
+        try item.setUpdate(spec.update, spec.installed_version, spec.latest_version);
         return item;
     }
 
@@ -335,6 +423,12 @@ pub const CacheItem = struct {
         }
         if (self.removal_target) |target| {
             self.allocator.free(target);
+        }
+        if (self.installed_version) |version| {
+            self.allocator.free(version);
+        }
+        if (self.latest_version) |version| {
+            self.allocator.free(version);
         }
         self.allocator.free(self.safety_info.headline);
         self.allocator.free(self.safety_info.explanation);

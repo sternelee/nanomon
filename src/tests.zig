@@ -31,6 +31,7 @@ test {
     _ = @import("cleanup/large.zig");
     _ = @import("cleanup/apps.zig");
     _ = @import("cleanup/scanner.zig");
+    _ = @import("cleanup/cli.zig");
     _ = @import("cleanup/trash.zig");
 }
 

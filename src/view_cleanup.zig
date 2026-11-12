@@ -20,7 +20,12 @@ const SafetyLevel = safety_mod.SafetyLevel;
 const row_h = 26;
 const header_h = 26;
 
+/// What a column shows. The row draws them in the order the header names
+/// them, so the two can never drift apart.
+const Field = enum { name, kind, where, version, size, safety };
+
 const Column = struct {
+    field: Field,
     title: []const u8,
     width: ?f32 = null,
     right: bool = false,
@@ -28,12 +33,30 @@ const Column = struct {
 };
 
 const columns = [_]Column{
-    .{ .title = "Name", .sort = .name },
-    .{ .title = "Kind", .width = 96 },
-    .{ .title = "Where", .width = 150 },
-    .{ .title = "Size", .width = 90, .right = true, .sort = .size },
-    .{ .title = "Safety", .width = 76, .sort = .safety },
+    .{ .field = .name, .title = "Name", .sort = .name },
+    .{ .field = .kind, .title = "Kind", .width = 96 },
+    .{ .field = .where, .title = "Where", .width = 150 },
+    .{ .field = .size, .title = "Size", .width = 90, .right = true, .sort = .size },
+    .{ .field = .safety, .title = "Safety", .width = 76, .sort = .safety },
 };
+
+/// The CLI Tools page adds a column: what is installed, and what its own
+/// manager would install instead. Its Kind and Where sort too, because that
+/// is how a list of several hundred tools is read: by what they are, and by
+/// the manager that owns them.
+const columns_cli = [_]Column{
+    .{ .field = .name, .title = "Name", .sort = .name },
+    .{ .field = .kind, .title = "Kind", .width = 120, .sort = .kind },
+    .{ .field = .where, .title = "Where", .width = 80, .sort = .where },
+    .{ .field = .version, .title = "Version", .width = 150 },
+    .{ .field = .size, .title = "Size", .width = 78, .right = true, .sort = .size },
+    .{ .field = .safety, .title = "Safety", .width = 76, .sort = .safety },
+};
+
+/// The columns the page in hand shows.
+fn currentColumns(a: *App) []const Column {
+    return if (a.cleanup_tab == .cli) &columns_cli else &columns;
+}
 
 fn cell(c: *ui.Context, col: Column, h: f32) ui.Div {
     var d = ui.div(c).row().h(h).itemsCenter().px(10).clip();
@@ -66,12 +89,12 @@ pub fn kindIcon(category: item_mod.Category) []const u8 {
         .cache => "internaldrive",
         .junk => "doc.text",
         .dev => "chevron.left.forwardslash.chevron.right",
+        .cli => "terminal",
         .project => "folder",
         .large => "doc",
         .app => "app.badge",
         .simulator => "cube",
         .xcode => "wrench.and.screwdriver",
-        .brew => "gearshape",
         .other => "folder",
     };
 }
@@ -140,12 +163,42 @@ fn head(c: *ui.Context, a: *App, k: theme.Colors) void {
             if (a.window) |w| w.redraw();
         }
     }
-    if (ui.button(c, if (a.cleanup_scanning) "Scanning…" else "Scan", .{
-        .variant = .primary,
-        .size = 12,
-        .icon = "arrow.clockwise",
-        .disabled = a.cleanup_scanning or a.cleanup_removing,
-    }).clicked) a.startCleanupScan();
+    scanButton(c, a, k, .primary, 12);
+}
+
+/// A button's look, named as nanoui names it (its own `ButtonVariant` is not
+/// one of the ui module's exports).
+const Variant = @FieldType(ui.ButtonOptions, "variant");
+
+/// Scan, with its arrow turning while the scan runs: a `ui.button` draws its
+/// own icon, and there is no reaching it to set an angle, so while the button
+/// is disabled anyway it is drawn here instead — the same box, with the
+/// arrow's angle read from the frame clock.
+fn scanButton(c: *ui.Context, a: *App, k: theme.Colors, variant: Variant, size: f32) void {
+    const scanning = a.cleanup_scanning;
+    const label = if (scanning) "Scanning…" else "Scan";
+    if (!scanning and !a.cleanup_removing) {
+        if (ui.button(c, label, .{ .variant = variant, .size = size, .icon = "arrow.clockwise" }).clicked) a.startCleanupScan();
+        return;
+    }
+    const fg: ui.Color = switch (variant) {
+        .primary, .danger => k.on_picked,
+        else => k.text,
+    };
+    var d = ui.div(c).row().itemsCenter().justifyCenter().gap(size * 0.4).px(size).py(size * 0.5).rounded(8).opacity(0.45);
+    d = switch (variant) {
+        .primary => d.bg(k.accent),
+        .danger => d.bg(k.red),
+        .secondary => d.bg(k.control_on).border(k.border).shadow(.{ .color = .{ .a = 0.14 }, .blur = 2, .y = 1 }),
+        .ghost => d,
+    };
+    defer d.end();
+    // One turn a second, clockwise; nothing else here turns.
+    const angle: f32 = if (scanning) @floatCast(@mod(c.time, 1.0) * std.math.tau) else 0;
+    ui.icon(c, "arrow.clockwise", .{ .size = size, .weight = .medium, .color = fg, .rotation = angle });
+    ui.text(c, label, .{ .size = size, .weight = .medium, .color = fg });
+    // A frame in a sixtieth: the arrow has moved by the next one.
+    if (scanning) c.frameIn(1.0 / 60.0);
 }
 
 fn columnsHeader(c: *ui.Context, a: *App, k: theme.Colors) void {
@@ -160,7 +213,7 @@ fn columnsHeader(c: *ui.Context, a: *App, k: theme.Colors) void {
         }
         tick(c, k, a.cleanupAllSelected());
     }
-    for (columns, 0..) |col, i| {
+    for (currentColumns(a), 0..) |col, i| {
         if (i > 0) divider(c, k);
         var d = cell(c, col, header_h).gap(4);
         if (col.sort) |sort| {
@@ -192,6 +245,7 @@ fn list(c: *ui.Context, a: *App, k: theme.Colors) void {
                 .overview => .{ "Nothing measured yet", "Press Scan to see where the space went" },
                 .caches => .{ "Nothing to clean here", "Caches, logs and system junk show up here" },
                 .dev => .{ "No build folders found", "Tool caches and project build folders show up here" },
+                .cli => .{ "No command-line tools found", "What Homebrew, npm, pnpm, bun, pipx and cargo installed shows up here" },
                 .large => .{ "No large files found", "Files over 100 MB in your folders show up here" },
                 .uninstall => .{ "No apps found", "The apps in Applications show up here" },
             };
@@ -226,46 +280,65 @@ fn row(c: *ui.Context, a: *App, k: theme.Colors, item: *CacheItem, i: usize) voi
         defer box.end();
         tick(c, k, on);
     }
-    {
-        const name_cell = cell(c, columns[0], row_h).gap(7);
-        defer name_cell.end();
-        rowIcon(c, a, k, item, 16);
-        ui.text(c, item.app_name, .{ .size = 12.5, .color = k.text });
-        // An app is more than its bundle: say how much more is coming with it.
-        if (item.locations.items.len > 1) {
-            ui.text(c, c.print("+{d}", .{item.locations.items.len - 1}), .{ .size = 10.5, .color = k.tertiary });
-        }
-        if (item.safety_info.reinstall_command != null) ui.icon(c, "chevron.left.forwardslash.chevron.right", .{ .size = 9, .color = k.tertiary });
+    for (currentColumns(a), 0..) |col, at| {
+        if (at > 0) divider(c, k);
+        rowCell(c, a, k, col, item);
     }
-    divider(c, k);
-    {
-        const kind_cell = cell(c, columns[1], row_h);
-        defer kind_cell.end();
-        ui.text(c, kindLabel(item), .{ .size = 11.5, .color = k.secondary });
-    }
-    divider(c, k);
-    {
-        const where_cell = cell(c, columns[2], row_h);
-        defer where_cell.end();
-        const where = if (item.locations.items.len > 0) item.locations.items[0].folder_name else "";
-        ui.text(c, where, .{ .size = 11.5, .color = k.tertiary });
-    }
-    divider(c, k);
-    {
-        const size_cell = cell(c, columns[3], row_h);
-        defer size_cell.end();
-        var buf: [32]u8 = undefined;
-        if (!item.measured) {
-            ui.text(c, "—", .{ .size = 11.5, .mono = true, .color = k.tertiary });
-        } else ui.text(c, c.print("{s}{s}", .{ if (item.approx()) "≈ " else "", item.formatSize(&buf) }), .{ .size = 11.5, .mono = true, .color = k.text });
-    }
-    divider(c, k);
-    {
-        const safety_cell = cell(c, columns[4], row_h).gap(5);
-        defer safety_cell.end();
-        const color = safetyColor(item.safety_info.level, k);
-        _ = c.leaf(.{ .width = .{ .px = 6 }, .height = .{ .px = 6 }, .radius = 3, .background = color }, .none, null);
-        ui.text(c, item.safety_info.level.shortName(), .{ .size = 11.5, .color = color });
+}
+
+/// One cell of a row, in the column the header named.
+fn rowCell(c: *ui.Context, a: *App, k: theme.Colors, col: Column, item: *CacheItem) void {
+    switch (col.field) {
+        .name => {
+            const name_cell = cell(c, col, row_h).gap(7);
+            defer name_cell.end();
+            rowIcon(c, a, k, item, 16);
+            ui.text(c, item.app_name, .{ .size = 12.5, .color = k.text });
+            // An app is more than its bundle: say how much more is coming with it.
+            if (item.locations.items.len > 1) {
+                ui.text(c, c.print("+{d}", .{item.locations.items.len - 1}), .{ .size = 10.5, .color = k.tertiary });
+            }
+            if (item.safety_info.reinstall_command != null) ui.icon(c, "chevron.left.forwardslash.chevron.right", .{ .size = 9, .color = k.tertiary });
+        },
+        .kind => {
+            const kind_cell = cell(c, col, row_h);
+            defer kind_cell.end();
+            ui.text(c, kindLabel(item), .{ .size = 11.5, .color = k.secondary });
+        },
+        .where => {
+            const where_cell = cell(c, col, row_h);
+            defer where_cell.end();
+            ui.text(c, item.where(), .{ .size = 11.5, .color = k.tertiary });
+        },
+        .version => {
+            const version_cell = cell(c, col, row_h).gap(5);
+            defer version_cell.end();
+            if (item.installed_version) |installed| {
+                ui.text(c, installed, .{ .size = 11.5, .mono = true, .color = if (item.outdated()) k.secondary else k.tertiary });
+                // Behind: the version its own update command would install.
+                if (item.latest_version) |latest| {
+                    ui.icon(c, "arrow.right", .{ .size = 8, .weight = .bold, .color = k.orange });
+                    ui.text(c, latest, .{ .size = 11.5, .mono = true, .color = k.orange });
+                }
+            } else {
+                ui.text(c, "—", .{ .size = 11.5, .mono = true, .color = k.tertiary });
+            }
+        },
+        .size => {
+            const size_cell = cell(c, col, row_h);
+            defer size_cell.end();
+            var buf: [32]u8 = undefined;
+            if (!item.measured) {
+                ui.text(c, "—", .{ .size = 11.5, .mono = true, .color = k.tertiary });
+            } else ui.text(c, c.print("{s}{s}", .{ if (item.approx()) "≈ " else "", item.formatSize(&buf) }), .{ .size = 11.5, .mono = true, .color = k.text });
+        },
+        .safety => {
+            const safety_cell = cell(c, col, row_h).gap(5);
+            defer safety_cell.end();
+            const color = safetyColor(item.safety_info.level, k);
+            _ = c.leaf(.{ .width = .{ .px = 6 }, .height = .{ .px = 6 }, .radius = 3, .background = color }, .none, null);
+            ui.text(c, item.safety_info.level.shortName(), .{ .size = 11.5, .color = color });
+        },
     }
 }
 
@@ -289,9 +362,19 @@ fn footer(c: *ui.Context, a: *App, k: theme.Colors) void {
                 a.cleanup_selected.clearRetainingCapacity();
                 if (a.window) |w| w.redraw();
             }
-            const label = if (a.cleanup_removing) "Removing…" else c.print("{s}…", .{a.cleanupSelectionVerb()});
+            // A tool its manager can bring up to date gets a second action:
+            // an update replaces what is there, it removes nothing.
+            const updates = a.cleanupSelectionUpdates();
+            if (updates > 0) {
+                const label = if (a.cleanup_updating) "Updating…" else c.print("Update {d}…", .{updates});
+                if (ui.button(c, label, .{ .variant = .secondary, .size = 12, .icon = "arrow.down.circle", .disabled = a.cleanup_removing }).clicked) {
+                    a.cleanup_confirm = .update;
+                    if (a.window) |w| w.redraw();
+                }
+            }
+            const label = if (a.cleanup_removing and !a.cleanup_updating) "Removing…" else c.print("{s}…", .{a.cleanupSelectionVerb()});
             if (ui.button(c, label, .{ .variant = .primary, .size = 12, .icon = "trash", .disabled = a.cleanup_removing }).clicked) {
-                a.cleanup_confirm = true;
+                a.cleanup_confirm = .remove;
                 if (a.window) |w| w.redraw();
             }
         }
@@ -349,12 +432,7 @@ pub fn space(c: *ui.Context, a: *App, k: theme.Colors) void {
         } else if (a.cleanup_scanning) {
             ui.text(c, "Measuring…", .{ .size = 11, .color = k.secondary });
         }
-        if (ui.button(c, if (a.cleanup_scanning) "Scanning…" else "Scan", .{
-            .variant = .secondary,
-            .size = 11.5,
-            .icon = "arrow.clockwise",
-            .disabled = a.cleanup_scanning or a.cleanup_removing,
-        }).clicked) a.startCleanupScan();
+        scanButton(c, a, k, .secondary, 11.5);
     }
     if (a.cleanup_volume) |disk| {
         kit.bar(c, k, @as(f32, @floatFromInt(disk.used)) / @as(f32, @floatFromInt(@max(1, disk.total))), k.accent);
@@ -367,7 +445,7 @@ pub fn space(c: *ui.Context, a: *App, k: theme.Colors) void {
             const col = ui.div(c).column().grow().w(0).gap(3);
             defer col.end();
             ui.text(c, "What Cleanup found", .{ .size = 11, .weight = .semibold, .color = k.tertiary });
-            const tabs = [_]CleanupTab{ .caches, .dev, .large, .uninstall };
+            const tabs = [_]CleanupTab{ .caches, .dev, .cli, .large, .uninstall };
             for (tabs) |tab| {
                 const totals = a.cleanupTabTotals(tab);
                 ui.key(c, c.print("space-{s}", .{tab.title()}));

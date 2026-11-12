@@ -15,6 +15,10 @@ pub const Options = struct {
     max_depth: usize = 8,
     max_visited: usize = 40000,
     max_items: usize = 200,
+    /// Where each file found goes the moment it is seen, so the page fills in
+    /// while the walk carries on. The scanner measures it and hands it on;
+    /// null keeps it here, for the pass to return.
+    batch: ?item_mod.Batch = null,
 };
 
 /// What a big file is, from its name: what the Kind column says.
@@ -50,7 +54,7 @@ pub fn scan(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.ArrayL
         state.items.deinit(allocator);
     }
     for (opts.roots) |root| {
-        if (state.visited >= opts.max_visited or state.items.items.len >= opts.max_items) break;
+        if (state.visited >= opts.max_visited or state.found >= opts.max_items) break;
         const full = std.fs.path.join(allocator, &.{ opts.home, root }) catch continue;
         defer allocator.free(full);
         walk(allocator, io, opts, &state, full, root, 0);
@@ -60,11 +64,14 @@ pub fn scan(allocator: std.mem.Allocator, io: std.Io, opts: Options) !std.ArrayL
 
 const Walk = struct {
     items: std.ArrayListUnmanaged(*CacheItem),
+    /// Every file offered, the ones already handed over included: the walk's
+    /// own bound, which the batch in `items` cannot be.
+    found: usize = 0,
     visited: usize = 0,
 };
 
 fn walk(allocator: std.mem.Allocator, io: std.Io, opts: Options, st: *Walk, path: []const u8, label: []const u8, depth: usize) void {
-    if (st.visited >= opts.max_visited or st.items.items.len >= opts.max_items) return;
+    if (st.visited >= opts.max_visited or st.found >= opts.max_items) return;
     if (depth > opts.max_depth) return;
     st.visited += 1;
 
@@ -77,13 +84,19 @@ fn walk(allocator: std.mem.Allocator, io: std.Io, opts: Options, st: *Walk, path
 
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (st.items.items.len >= opts.max_items) return;
+        if (st.found >= opts.max_items) return;
         switch (entry.kind) {
             .file => {
                 const stat = dir.statFile(io, entry.name, .{}) catch continue;
                 if (stat.size < opts.min_bytes) continue;
                 const full = std.fs.path.join(a, &.{ path, entry.name }) catch continue;
+                const before = st.items.items.len;
                 addFile(allocator, &st.items, full, label, entry.name, stat.size) catch continue;
+                if (st.items.items.len > before) {
+                    st.found += 1;
+                    // The size is already known: the row can be shown at once.
+                    if (opts.batch) |b| b.give(b.ctx, .large, &st.items);
+                }
             },
             .directory => {
                 if (skipDir(entry.name)) continue;

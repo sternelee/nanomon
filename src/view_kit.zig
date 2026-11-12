@@ -20,6 +20,7 @@ pub fn tabColor(tab: app_mod.CleanupTab, k: theme.Colors) ui.Color {
         .overview => k.gray,
         .caches => k.orange,
         .dev => k.purple,
+        .cli => k.teal,
         .large => k.blue,
         .uninstall => k.red,
     };
